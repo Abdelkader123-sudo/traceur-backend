@@ -36,7 +36,7 @@ MONGO_URI = os.environ["MONGO_URI"]
 # --- Paramètres de l'analyse ---
 MIN_POSITIONS_ANALYSE = 100      # minimum de positions par animal pour lancer DBSCAN
 MAX_POSITIONS_ANALYSE = 5000     # on n'analyse que les positions les plus récentes
-INTERVALLE_RECALCUL_S = 86400    # recalcul automatique des zones : 1 fois par jour
+INTERVALLE_RECALCUL_S = 300    # recalcul automatique des zones : 1 fois par chaque 5 min
 
 mongo_client = MongoClient(MONGO_URI, tz_aware=True)
 base = mongo_client["traceur_gps"]
