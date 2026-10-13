@@ -35,7 +35,7 @@ MONGO_URI = os.environ["MONGO_URI"]
 
 MIN_POSITIONS_ANALYSE = 50      
 MAX_POSITIONS_ANALYSE = 100     
-INTERVALLE_RECALCUL_S = 900    
+INTERVALLE_RECALCUL_S = 1800        
 
 mongo_client = MongoClient(MONGO_URI, tz_aware=True)
 base = mongo_client["traceur_gps"]
