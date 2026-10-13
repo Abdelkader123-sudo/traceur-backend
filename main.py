@@ -21,22 +21,21 @@ from analyse import (
     est_immobile,
 )
 
-# --- Paramètres du broker MQTT (identiques à ceux de Node-RED) ---
-# --- Paramètres du broker MQTT ---
+
 MQTT_HOST = os.getenv("MQTT_HOST", "ycf81881.ala.eu-central-1.emqxsl.com")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
 MQTT_USER = os.environ["MQTT_USER"]
 MQTT_PASSWORD = os.environ["MQTT_PASSWORD"]
-MQTT_TOPIC = os.getenv("MQTT_TOPIC", "farm/+/data")  # + = n'importe quel animal
+MQTT_TOPIC = os.getenv("MQTT_TOPIC", "farm/+/data")  
 CA_FILE = os.getenv("CA_FILE", "emqxsl-ca.crt")
 
-# --- Paramètres MongoDB Atlas ---
+
 MONGO_URI = os.environ["MONGO_URI"]
 
-# --- Paramètres de l'analyse ---
-MIN_POSITIONS_ANALYSE = 100      # minimum de positions par animal pour lancer DBSCAN
-MAX_POSITIONS_ANALYSE = 5000     # on n'analyse que les positions les plus récentes
-INTERVALLE_RECALCUL_S = 300    # recalcul automatique des zones : 1 fois par chaque 5 min
+
+MIN_POSITIONS_ANALYSE = 50      
+MAX_POSITIONS_ANALYSE = 5000     
+INTERVALLE_RECALCUL_S = 900    
 
 mongo_client = MongoClient(MONGO_URI, tz_aware=True)
 base = mongo_client["traceur_gps"]
@@ -55,9 +54,7 @@ class Position(BaseModel):
     timestamp: datetime
 
 
-# ---------------------------------------------------------------------------
-# Alertes
-# ---------------------------------------------------------------------------
+
 def gerer_alerte(animal_id, type_alerte, condition, message, position):
     """Ouvre une alerte quand le problème apparaît, la ferme quand il disparaît.
 
@@ -88,7 +85,7 @@ def gerer_alerte(animal_id, type_alerte, condition, message, position):
 
 def verifier_alertes(p):
     """Applique les trois détections à la position qui vient d'arriver."""
-    # 1. Sortie de zone (si les zones de l'animal sont connues)
+    
     doc = geofences.find_one({"animal_id": p.animal_id})
     if doc and doc.get("zones"):
         ecart = ecart_a_la_zone(p.lat, p.lon, doc["zones"])
@@ -97,7 +94,7 @@ def verifier_alertes(p):
             f"À {round(ecart)} m de sa zone habituelle la plus proche", p,
         )
 
-    # 2. Immobilité prolongée : tout est « repos » sur la fenêtre de temps
+    
     debut = p.timestamp - timedelta(seconds=DUREE_IMMOBILITE_S)
     fenetre = list(
         positions.find(
@@ -110,14 +107,14 @@ def verifier_alertes(p):
         {"_id": 0},
         sort=[("timestamp", -1)],
     )
-    if repere:  # dernier message avant la fenêtre : l'animal y était-il déjà au repos ?
+    if repere:  
         fenetre.insert(0, repere)
     gerer_alerte(
         p.animal_id, "immobilite", est_immobile(fenetre, DUREE_IMMOBILITE_S),
         f"Au repos depuis plus de {DUREE_IMMOBILITE_S // 60} min", p,
     )
 
-    # 3. Déplacement inhabituel : plusieurs mesures rapides d'affilée
+    
     dernieres = list(
         positions.find({"animal_id": p.animal_id}, {"_id": 0})
         .sort("timestamp", -1)
@@ -130,9 +127,7 @@ def verifier_alertes(p):
     )
 
 
-# ---------------------------------------------------------------------------
-# Zones habituelles (DBSCAN)
-# ---------------------------------------------------------------------------
+
 def recalculer_zones(animal_id):
     """Applique DBSCAN sur l'historique d'un animal et enregistre ses zones."""
     docs = list(
@@ -183,9 +178,7 @@ async def recalcul_periodique():
         await asyncio.sleep(INTERVALLE_RECALCUL_S)
 
 
-# ---------------------------------------------------------------------------
-# MQTT
-# ---------------------------------------------------------------------------
+
 def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
         print("Connecté au broker MQTT")
@@ -222,12 +215,10 @@ mqtt_client.on_connect = on_connect
 mqtt_client.on_message = on_message
 
 
-# ---------------------------------------------------------------------------
-# API
-# ---------------------------------------------------------------------------
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Démarrage : index MongoDB, connexion au broker, recalcul périodique
+
     await asyncio.to_thread(
         positions.create_index, [("animal_id", 1), ("timestamp", -1)]
     )
@@ -235,7 +226,7 @@ async def lifespan(app: FastAPI):
     mqtt_client.loop_start()
     tache = asyncio.create_task(recalcul_periodique())
     yield
-    # Arrêt : fermeture propre
+    
     tache.cancel()
     mqtt_client.loop_stop()
     mqtt_client.disconnect()
