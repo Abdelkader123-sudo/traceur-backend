@@ -4,7 +4,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-
+from sante import JOURS_EVALUATION, JOURS_REFERENCE, evaluer_sante
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI
 from pydantic import BaseModel, ValidationError
@@ -40,7 +40,7 @@ base = mongo_client["traceur_gps"]
 positions = base["positions"]
 alerts = base["alerts"]
 etat_animaux = base["etat_animaux"]
-
+animaux = base["animaux"]   # fiches saisies plus tard par l'application (facultatif)
 
 class Position(BaseModel):
     """Format attendu pour chaque message MQTT (le « contrat »)."""
@@ -313,3 +313,17 @@ def etat_troupeau():
         "nb_animaux_en_alerte": len(en_alerte),
         "animaux_en_alerte": en_alerte,
     }
+@app.get("/sante/{animal_id}")
+def sante(animal_id: str):
+    """Écarts de comportement d'un animal par rapport à sa propre habitude."""
+    maintenant = datetime.now(timezone.utc)
+    fin = maintenant.replace(hour=0, minute=0, second=0, microsecond=0)
+    debut = fin - timedelta(days=JOURS_REFERENCE + JOURS_EVALUATION)
+    mesures = list(positions.find(
+        {"animal_id": animal_id, "timestamp": {"$gte": debut, "$lt": fin}},
+        {"_id": 0},
+    ).sort("timestamp", 1))
+    fiche = animaux.find_one({"animal_id": animal_id}, {"_id": 0})
+    resultat = evaluer_sante(mesures, fiche, maintenant)
+    resultat["animal_id"] = animal_id
+    return resultat

@@ -10,7 +10,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Code + certificat CA du broker EMQX
-COPY main.py analyse.py emqxsl-ca.crt ./
+COPY main.py analyse.py sante.py emqxsl-ca.crt ./
 
 # Utilisateur non-root
 RUN useradd -m appuser
