@@ -288,7 +288,9 @@ mqtt_client.on_message = on_message
 # API
 # ---------------------------------------------------------------------------
 @asynccontextmanager
+@asynccontextmanager
 async def lifespan(app: FastAPI):
+    diffuseur.boucle = asyncio.get_running_loop()
     await asyncio.to_thread(
         positions.create_index, [("animal_id", 1), ("timestamp", -1)]
     )
