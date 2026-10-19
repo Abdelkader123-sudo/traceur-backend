@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from sante import JOURS_EVALUATION, JOURS_REFERENCE, evaluer_sante
 import paho.mqtt.client as mqtt
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ValidationError
 from pymongo import MongoClient
 
@@ -41,7 +41,36 @@ positions = base["positions"]
 alerts = base["alerts"]
 etat_animaux = base["etat_animaux"]
 animaux = base["animaux"]   # fiches saisies plus tard par l'application (facultatif)
+def _json(o):
+    """Sérialise les dates en ISO 8601 pour le WebSocket."""
+    if isinstance(o, datetime):
+        return o.isoformat()
+    return str(o)
 
+
+class Diffuseur:
+    """Envoie les événements à tous les clients WebSocket connectés."""
+
+    def __init__(self):
+        self.clients: set[WebSocket] = set()
+        self.boucle = None          # boucle asyncio de FastAPI
+
+    async def _envoyer(self, texte: str):
+        for ws in list(self.clients):
+            try:
+                await ws.send_text(texte)
+            except Exception:
+                self.clients.discard(ws)
+
+    def publier(self, evenement: dict):
+        """Appelable depuis le thread MQTT (qui n'est pas celui de FastAPI)."""
+        if self.boucle is None or not self.clients:
+            return
+        texte = json.dumps(evenement, default=_json)
+        asyncio.run_coroutine_threadsafe(self._envoyer(texte), self.boucle)
+
+
+diffuseur = Diffuseur()
 class Position(BaseModel):
     """Format attendu pour chaque message MQTT (le « contrat »)."""
     animal_id: str
@@ -61,7 +90,7 @@ def gerer_alerte(animal_id, type_alerte, condition, message, position):
         {"animal_id": animal_id, "type": type_alerte, "resolue": False}
     )
     if condition and ouverte is None:
-        alerts.insert_one({
+        doc = {
             "animal_id": animal_id,
             "type": type_alerte,
             "message": message,
@@ -69,14 +98,21 @@ def gerer_alerte(animal_id, type_alerte, condition, message, position):
             "lon": position.lon,
             "timestamp": position.timestamp,
             "resolue": False,
-        })
+        }
+        alerts.insert_one(dict(doc))   # copie : insert_one ajoute _id
         print(f"ALERTE [{type_alerte}] {animal_id} : {message}")
+        diffuseur.publier({"type": "alerte", "data": doc})
     elif not condition and ouverte is not None:
         alerts.update_one(
             {"_id": ouverte["_id"]},
             {"$set": {"resolue": True, "resolue_le": position.timestamp}},
         )
         print(f"Alerte résolue [{type_alerte}] {animal_id}")
+        diffuseur.publier({"type": "alerte_resolue", "data": {
+            "animal_id": animal_id,
+            "type": type_alerte,
+            "resolue_le": position.timestamp,
+        }})
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +266,7 @@ def on_message(client, userdata, msg):
 
     positions.insert_one(position.model_dump())
     print(f"Enregistré : {position.animal_id} ({position.lat}, {position.lon})")
+    diffuseur.publier({"type": "position", "data": position.model_dump()})
 
     try:
         # Le collier a émis : l'éventuelle alerte de silence est résolue
@@ -327,3 +364,36 @@ def sante(animal_id: str):
     resultat = evaluer_sante(mesures, fiche, maintenant)
     resultat["animal_id"] = animal_id
     return resultat
+def etat_complet() -> dict:
+    """Photo de départ envoyée à chaque nouveau client."""
+    dernieres = []
+    for animal_id in positions.distinct("animal_id"):
+        doc = positions.find_one(
+            {"animal_id": animal_id}, {"_id": 0}, sort=[("timestamp", -1)]
+        )
+        if doc:
+            dernieres.append(doc)
+    actives = list(
+        alerts.find({"resolue": False}, {"_id": 0}).sort("timestamp", -1).limit(100)
+    )
+    return {
+        "type": "etat",
+        "positions": dernieres,
+        "alertes_actives": actives,
+        "troupeau": etat_troupeau(),
+    }
+
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    try:
+        etat = await asyncio.to_thread(etat_complet)
+        await ws.send_text(json.dumps(etat, default=_json))
+        diffuseur.clients.add(ws)           # après l'état : pas d'événement avant lui
+        while True:
+            await ws.receive_text()         # le client envoie "ping" pour garder la ligne
+    except WebSocketDisconnect:
+        pass
+    finally:
+        diffuseur.clients.discard(ws)
