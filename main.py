@@ -4,7 +4,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from sante import JOURS_EVALUATION, JOURS_REFERENCE, evaluer_sante
+
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ValidationError
@@ -23,6 +23,7 @@ from analyse import (
     deplacement_inhabituel,
     est_immobile,
 )
+from sante import JOURS_EVALUATION, JOURS_REFERENCE, evaluer_sante
 
 MQTT_HOST = os.getenv("MQTT_HOST", "ycf81881.ala.eu-central-1.emqxsl.com")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
@@ -41,6 +42,11 @@ positions = base["positions"]
 alerts = base["alerts"]
 etat_animaux = base["etat_animaux"]
 animaux = base["animaux"]   # fiches saisies plus tard par l'application (facultatif)
+
+
+# ---------------------------------------------------------------------------
+# Diffusion WebSocket
+# ---------------------------------------------------------------------------
 def _json(o):
     """Sérialise les dates en ISO 8601 pour le WebSocket."""
     if isinstance(o, datetime):
@@ -71,6 +77,8 @@ class Diffuseur:
 
 
 diffuseur = Diffuseur()
+
+
 class Position(BaseModel):
     """Format attendu pour chaque message MQTT (le « contrat »)."""
     animal_id: str
@@ -221,8 +229,7 @@ def verifier_colliers():
         )
         if not doc:
             continue
-        age = (maintenant - doc["timestamp"]).total_seconds()       
-        # animal retiré : on ne le surveille plus
+        age = (maintenant - doc["timestamp"]).total_seconds()
         silencieux = age > DELAI_COLLIER_S
         doc["timestamp"] = maintenant     # date de l'alerte = maintenant
         gerer_alerte(
@@ -288,7 +295,6 @@ mqtt_client.on_message = on_message
 # API
 # ---------------------------------------------------------------------------
 @asynccontextmanager
-@asynccontextmanager
 async def lifespan(app: FastAPI):
     diffuseur.boucle = asyncio.get_running_loop()
     await asyncio.to_thread(
@@ -352,6 +358,8 @@ def etat_troupeau():
         "nb_animaux_en_alerte": len(en_alerte),
         "animaux_en_alerte": en_alerte,
     }
+
+
 @app.get("/sante/{animal_id}")
 def sante(animal_id: str):
     """Écarts de comportement d'un animal par rapport à sa propre habitude."""
@@ -366,6 +374,8 @@ def sante(animal_id: str):
     resultat = evaluer_sante(mesures, fiche, maintenant)
     resultat["animal_id"] = animal_id
     return resultat
+
+
 def etat_complet() -> dict:
     """Photo de départ envoyée à chaque nouveau client."""
     dernieres = []
