@@ -4,7 +4,9 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from geofence import analyser_point, valider_sommets
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ValidationError
@@ -42,7 +44,17 @@ positions = base["positions"]
 alerts = base["alerts"]
 etat_animaux = base["etat_animaux"]
 animaux = base["animaux"]   # fiches saisies plus tard par l'application (facultatif)
+pasture = base["pastures"]
+MARGE_PATURE_M = 10   # tolérance GPS : alerte au-delà de 10 m hors du bord (EXPÉRIMENTAL)
+_cache_zone = {"zone": None, "charge": False}
 
+
+def zone_active():
+    """Dernière zone enregistrée (mise en cache, rechargée à chaque envoi)."""
+    if not _cache_zone["charge"]:
+        _cache_zone["zone"] = pasture.find_one({"active": True}, {"_id": 0})
+        _cache_zone["charge"] = True
+    return _cache_zone["zone"]
 
 # ---------------------------------------------------------------------------
 # Diffusion WebSocket
@@ -184,6 +196,19 @@ def verifier_troupeau(p):
 # ---------------------------------------------------------------------------
 # Alertes individuelles
 # ---------------------------------------------------------------------------
+def verifier_pature(p):
+    """Alerte hors_pature si l'animal est à plus de MARGE_PATURE_M hors de la zone."""
+    zone = zone_active()
+    if not zone:
+        return
+    sommets = [(c["latitude"], c["longitude"]) for c in zone["coordinates"]]
+    dedans, bord = analyser_point(p.lat, p.lon, sommets)
+    hors = (not dedans) and bord > MARGE_PATURE_M
+    gerer_alerte(
+        p.animal_id, "hors_pature", hors,
+        f"Hors de la zone « {zone['name']} », à {round(bord)} m du bord", p,
+    )
+
 def verifier_alertes_individuelles(p):
     """Immobilité prolongée et déplacement inhabituel (par animal)."""
     debut = p.timestamp - timedelta(seconds=DUREE_IMMOBILITE_S)
@@ -262,6 +287,9 @@ def on_connect(client, userdata, flags, reason_code, properties):
 
 def on_message(client, userdata, msg):
     try:
+        verifier_troupeau(position)
+        verifier_pature(position)
+        verifier_alertes_individuelles(position)
         data = json.loads(msg.payload.decode("utf-8"))
         position = Position(**data)
     except (json.JSONDecodeError, ValidationError) as erreur:
@@ -314,7 +342,41 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["GET", "POST"], allow_headers=["*"])
 
+
+@app.post("/pastures")
+def creer_pature(donnees: dict):
+    """Enregistre la zone (remplace l'ancienne) et revérifie tous les animaux."""
+    try:
+        sommets = valider_sommets(donnees.get("coordinates"))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    zone = {
+        "name": str(donnees.get("name") or "Zone de pâturage")[:80],
+        "coordinates": [{"latitude": a, "longitude": b} for a, b in sommets],
+        "cree_le": datetime.now(timezone.utc),
+        "active": True,
+    }
+    pasture.update_many({"active": True}, {"$set": {"active": False}})
+    pasture.insert_one(dict(zone))
+    _cache_zone["zone"], _cache_zone["charge"] = zone, True
+
+    # Vérification immédiate de la dernière position de chaque animal
+    nb_hors = 0
+    for animal_id in positions.distinct("animal_id"):
+        d = positions.find_one({"animal_id": animal_id}, sort=[("timestamp", -1)])
+        if d:
+            verifier_pature(Position(**{k: d[k] for k in Position.model_fields}))
+    diffuseur.publier({"type": "pature", "data": {
+        "name": zone["name"], "coordinates": zone["coordinates"]}})
+    return {"statut": "ok", "sommets": len(sommets)}
+
+
+@app.get("/pastures")
+def lire_pature():
+    return zone_active() or {"statut": "aucune zone"}
 
 @app.get("/positions")
 def lire_positions(animal_id: Optional[str] = None, limite: int = 50):
