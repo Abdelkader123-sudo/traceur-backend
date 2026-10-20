@@ -4,11 +4,10 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+
+import paho.mqtt.client as mqtt
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from geofence import analyser_point, valider_sommets
-import paho.mqtt.client as mqtt
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ValidationError
 from pymongo import MongoClient
 
@@ -25,6 +24,7 @@ from analyse import (
     deplacement_inhabituel,
     est_immobile,
 )
+from geofence import analyser_point, valider_sommets
 from sante import JOURS_EVALUATION, JOURS_REFERENCE, evaluer_sante
 
 MQTT_HOST = os.getenv("MQTT_HOST", "ycf81881.ala.eu-central-1.emqxsl.com")
@@ -45,6 +45,7 @@ alerts = base["alerts"]
 etat_animaux = base["etat_animaux"]
 animaux = base["animaux"]   # fiches saisies plus tard par l'application (facultatif)
 pasture = base["pastures"]
+
 MARGE_PATURE_M = 10   # tolérance GPS : alerte au-delà de 10 m hors du bord (EXPÉRIMENTAL)
 _cache_zone = {"zone": None, "charge": False}
 
@@ -55,6 +56,7 @@ def zone_active():
         _cache_zone["zone"] = pasture.find_one({"active": True}, {"_id": 0})
         _cache_zone["charge"] = True
     return _cache_zone["zone"]
+
 
 # ---------------------------------------------------------------------------
 # Diffusion WebSocket
@@ -194,7 +196,7 @@ def verifier_troupeau(p):
 
 
 # ---------------------------------------------------------------------------
-# Alertes individuelles
+# Géorepérage : zone de pâturage dessinée par l'utilisateur
 # ---------------------------------------------------------------------------
 def verifier_pature(p):
     """Alerte hors_pature si l'animal est à plus de MARGE_PATURE_M hors de la zone."""
@@ -209,6 +211,10 @@ def verifier_pature(p):
         f"Hors de la zone « {zone['name']} », à {round(bord)} m du bord", p,
     )
 
+
+# ---------------------------------------------------------------------------
+# Alertes individuelles
+# ---------------------------------------------------------------------------
 def verifier_alertes_individuelles(p):
     """Immobilité prolongée et déplacement inhabituel (par animal)."""
     debut = p.timestamp - timedelta(seconds=DUREE_IMMOBILITE_S)
@@ -286,10 +292,8 @@ def on_connect(client, userdata, flags, reason_code, properties):
 
 
 def on_message(client, userdata, msg):
+    # 1) Lire et valider le message (position n'existe qu'après cette étape)
     try:
-        verifier_troupeau(position)
-        verifier_pature(position)
-        verifier_alertes_individuelles(position)
         data = json.loads(msg.payload.decode("utf-8"))
         position = Position(**data)
     except (json.JSONDecodeError, ValidationError) as erreur:
@@ -299,17 +303,24 @@ def on_message(client, userdata, msg):
     if position.timestamp.tzinfo is None:
         position.timestamp = position.timestamp.replace(tzinfo=timezone.utc)
 
+    # 2) Enregistrer et diffuser la position
     positions.insert_one(position.model_dump())
     print(f"Enregistré : {position.animal_id} ({position.lat}, {position.lon})")
     diffuseur.publier({"type": "position", "data": position.model_dump()})
 
+    # 3) Détections : chacune isolée, une erreur n'arrête pas les autres
     try:
         # Le collier a émis : l'éventuelle alerte de silence est résolue
         gerer_alerte(position.animal_id, "collier_silencieux", False, "", position)
-        verifier_troupeau(position)
-        verifier_alertes_individuelles(position)
-    except Exception as erreur:  # ne jamais arrêter l'écoute MQTT
-        print(f"Erreur pendant la détection : {erreur}")
+    except Exception as erreur:
+        print(f"Erreur collier_silencieux : {erreur}")
+
+    for verification in (verifier_troupeau, verifier_pature,
+                         verifier_alertes_individuelles):
+        try:
+            verification(position)
+        except Exception as erreur:  # ne jamais arrêter l'écoute MQTT
+            print(f"Erreur {verification.__name__} : {erreur}")
 
 
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -342,8 +353,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_methods=["GET", "POST"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 
 @app.post("/pastures")
@@ -364,7 +379,6 @@ def creer_pature(donnees: dict):
     _cache_zone["zone"], _cache_zone["charge"] = zone, True
 
     # Vérification immédiate de la dernière position de chaque animal
-    nb_hors = 0
     for animal_id in positions.distinct("animal_id"):
         d = positions.find_one({"animal_id": animal_id}, sort=[("timestamp", -1)])
         if d:
@@ -377,6 +391,7 @@ def creer_pature(donnees: dict):
 @app.get("/pastures")
 def lire_pature():
     return zone_active() or {"statut": "aucune zone"}
+
 
 @app.get("/positions")
 def lire_positions(animal_id: Optional[str] = None, limite: int = 50):
@@ -450,11 +465,14 @@ def etat_complet() -> dict:
     actives = list(
         alerts.find({"resolue": False}, {"_id": 0}).sort("timestamp", -1).limit(100)
     )
+    zone = zone_active()
     return {
         "type": "etat",
         "positions": dernieres,
         "alertes_actives": actives,
         "troupeau": etat_troupeau(),
+        "pature": ({"name": zone["name"], "coordinates": zone["coordinates"]}
+                   if zone else None),
     }
 
 
