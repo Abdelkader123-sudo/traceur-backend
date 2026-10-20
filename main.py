@@ -356,7 +356,7 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -391,6 +391,30 @@ def creer_pature(donnees: dict):
 @app.get("/pastures")
 def lire_pature():
     return zone_active() or {"statut": "aucune zone"}
+
+
+@app.delete("/pastures")
+def supprimer_pature():
+    """Désactive la zone, résout les alertes hors_pature et prévient les clients."""
+    pasture.update_many({"active": True}, {"$set": {"active": False}})
+    _cache_zone["zone"], _cache_zone["charge"] = None, True
+
+    maintenant = datetime.now(timezone.utc)
+    nb_resolues = 0
+    for a in list(alerts.find({"type": "hors_pature", "resolue": False})):
+        alerts.update_one(
+            {"_id": a["_id"]},
+            {"$set": {"resolue": True, "resolue_le": maintenant}},
+        )
+        diffuseur.publier({"type": "alerte_resolue", "data": {
+            "animal_id": a["animal_id"],
+            "type": "hors_pature",
+            "resolue_le": maintenant,
+        }})
+        nb_resolues += 1
+
+    diffuseur.publier({"type": "pature", "data": None})
+    return {"statut": "ok", "alertes_resolues": nb_resolues}
 
 
 @app.get("/positions")
