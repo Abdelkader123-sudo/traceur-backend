@@ -37,21 +37,21 @@ CA_FILE = os.getenv("CA_FILE", "emqxsl-ca.crt")
 MONGO_URI = os.environ["MONGO_URI"]
 
 INTERVALLE_VERIF_COLLIERS_S = 60   # vérification des colliers silencieux
+MARGE_PATURE_M = 10   # tolérance GPS hors zone (EXPÉRIMENTAL)
 
 mongo_client = MongoClient(MONGO_URI, tz_aware=True)
 base = mongo_client["traceur_gps"]
 positions = base["positions"]
 alerts = base["alerts"]
 etat_animaux = base["etat_animaux"]
-animaux = base["animaux"]   # fiches saisies plus tard par l'application (facultatif)
+animaux = base["animaux"]
 pasture = base["pastures"]
 
-MARGE_PATURE_M = 10   # tolérance GPS : alerte au-delà de 10 m hors du bord (EXPÉRIMENTAL)
 _cache_zone = {"zone": None, "charge": False}
 
 
 def zone_active():
-    """Dernière zone enregistrée (mise en cache, rechargée à chaque envoi)."""
+    """Zone de pâturage active (mise en cache)."""
     if not _cache_zone["charge"]:
         _cache_zone["zone"] = pasture.find_one({"active": True}, {"_id": 0})
         _cache_zone["charge"] = True
@@ -62,7 +62,6 @@ def zone_active():
 # Diffusion WebSocket
 # ---------------------------------------------------------------------------
 def _json(o):
-    """Sérialise les dates en ISO 8601 pour le WebSocket."""
     if isinstance(o, datetime):
         return o.isoformat()
     return str(o)
@@ -73,7 +72,7 @@ class Diffuseur:
 
     def __init__(self):
         self.clients: set[WebSocket] = set()
-        self.boucle = None          # boucle asyncio de FastAPI
+        self.boucle = None
 
     async def _envoyer(self, texte: str):
         for ws in list(self.clients):
@@ -83,7 +82,7 @@ class Diffuseur:
                 self.clients.discard(ws)
 
     def publier(self, evenement: dict):
-        """Appelable depuis le thread MQTT (qui n'est pas celui de FastAPI)."""
+        """Appelable depuis le thread MQTT."""
         if self.boucle is None or not self.clients:
             return
         texte = json.dumps(evenement, default=_json)
@@ -94,7 +93,7 @@ diffuseur = Diffuseur()
 
 
 class Position(BaseModel):
-    """Format attendu pour chaque message MQTT (le « contrat »)."""
+    """Format attendu pour chaque message MQTT."""
     animal_id: str
     lat: float
     lon: float
@@ -121,7 +120,7 @@ def gerer_alerte(animal_id, type_alerte, condition, message, position):
             "timestamp": position.timestamp,
             "resolue": False,
         }
-        alerts.insert_one(dict(doc))   # copie : insert_one ajoute _id
+        alerts.insert_one(dict(doc))
         print(f"ALERTE [{type_alerte}] {animal_id} : {message}")
         diffuseur.publier({"type": "alerte", "data": doc})
     elif not condition and ouverte is not None:
@@ -138,7 +137,7 @@ def gerer_alerte(animal_id, type_alerte, condition, message, position):
 
 
 # ---------------------------------------------------------------------------
-# Troupeau : sortie de zone confirmée sur 2 messages
+# Troupeau
 # ---------------------------------------------------------------------------
 def positions_actuelles(reference):
     """Dernière position de chaque animal, si elle date de moins de FRAICHEUR_S."""
@@ -154,7 +153,6 @@ def positions_actuelles(reference):
 
 
 def nb_animaux_en_alerte(reference):
-    """Animaux dont le champ alerte vaut true (état récent uniquement)."""
     limite = reference - timedelta(seconds=FRAICHEUR_S)
     return etat_animaux.count_documents(
         {"alerte": True, "derniere_mesure": {"$gte": limite}}
@@ -162,17 +160,17 @@ def nb_animaux_en_alerte(reference):
 
 
 def verifier_troupeau(p):
-    """Met à jour le compteur de l'animal qui vient d'envoyer, puis l'alerte."""
+    """Sortie de zone du troupeau, confirmée sur plusieurs messages."""
     actuelles = positions_actuelles(p.timestamp)
     if len(actuelles) < MIN_ANIMAUX_TROUPEAU:
         return
     _, _, ecarts = analyser_troupeaux(actuelles)
 
-    ecart = ecarts.get(p.animal_id)          # None = dans le grand troupeau
+    ecart = ecarts.get(p.animal_id)
     hors = ecart is not None and ecart > DISTANCE_ALERTE_M
 
     etat = etat_animaux.find_one({"animal_id": p.animal_id}) or {}
-    nb_hors = etat.get("nb_hors_zone", 0) + 1 if hors else 0   # compteur conservé
+    nb_hors = etat.get("nb_hors_zone", 0) + 1 if hors else 0
     alerte = nb_hors >= NB_CONFIRMATIONS
 
     etat_animaux.update_one(
@@ -186,7 +184,7 @@ def verifier_troupeau(p):
         upsert=True,
     )
 
-    total = nb_animaux_en_alerte(p.timestamp)   # total recalculé à chaque mesure
+    total = nb_animaux_en_alerte(p.timestamp)
     message = (
         f"À {round(ecart or 0)} m du grand troupeau "
         f"(confirmé sur {NB_CONFIRMATIONS} mesures). "
@@ -196,7 +194,7 @@ def verifier_troupeau(p):
 
 
 # ---------------------------------------------------------------------------
-# Géorepérage : zone de pâturage dessinée par l'utilisateur
+# Géorepérage
 # ---------------------------------------------------------------------------
 def verifier_pature(p):
     """Alerte hors_pature si l'animal est à plus de MARGE_PATURE_M hors de la zone."""
@@ -216,7 +214,7 @@ def verifier_pature(p):
 # Alertes individuelles
 # ---------------------------------------------------------------------------
 def verifier_alertes_individuelles(p):
-    """Immobilité prolongée et déplacement inhabituel (par animal)."""
+    """Immobilité prolongée et déplacement inhabituel."""
     debut = p.timestamp - timedelta(seconds=DUREE_IMMOBILITE_S)
     fenetre = list(
         positions.find(
@@ -249,10 +247,9 @@ def verifier_alertes_individuelles(p):
 
 
 # ---------------------------------------------------------------------------
-# Collier silencieux (vérification périodique)
+# Collier silencieux
 # ---------------------------------------------------------------------------
 def verifier_colliers():
-    """Alerte si un animal n'a plus envoyé de message depuis DELAI_COLLIER_S."""
     maintenant = datetime.now(timezone.utc)
     for animal_id in positions.distinct("animal_id"):
         doc = positions.find_one(
@@ -262,7 +259,7 @@ def verifier_colliers():
             continue
         age = (maintenant - doc["timestamp"]).total_seconds()
         silencieux = age > DELAI_COLLIER_S
-        doc["timestamp"] = maintenant     # date de l'alerte = maintenant
+        doc["timestamp"] = maintenant
         gerer_alerte(
             animal_id, "collier_silencieux", silencieux,
             f"Aucun message depuis plus de {DELAI_COLLIER_S // 60} min",
@@ -292,7 +289,6 @@ def on_connect(client, userdata, flags, reason_code, properties):
 
 
 def on_message(client, userdata, msg):
-    # 1) Lire et valider le message (position n'existe qu'après cette étape)
     try:
         data = json.loads(msg.payload.decode("utf-8"))
         position = Position(**data)
@@ -303,14 +299,11 @@ def on_message(client, userdata, msg):
     if position.timestamp.tzinfo is None:
         position.timestamp = position.timestamp.replace(tzinfo=timezone.utc)
 
-    # 2) Enregistrer et diffuser la position
     positions.insert_one(position.model_dump())
     print(f"Enregistré : {position.animal_id} ({position.lat}, {position.lon})")
     diffuseur.publier({"type": "position", "data": position.model_dump()})
 
-    # 3) Détections : chacune isolée, une erreur n'arrête pas les autres
     try:
-        # Le collier a émis : l'éventuelle alerte de silence est résolue
         gerer_alerte(position.animal_id, "collier_silencieux", False, "", position)
     except Exception as erreur:
         print(f"Erreur collier_silencieux : {erreur}")
@@ -319,7 +312,7 @@ def on_message(client, userdata, msg):
                          verifier_alertes_individuelles):
         try:
             verification(position)
-        except Exception as erreur:  # ne jamais arrêter l'écoute MQTT
+        except Exception as erreur:
             print(f"Erreur {verification.__name__} : {erreur}")
 
 
@@ -378,11 +371,13 @@ def creer_pature(donnees: dict):
     pasture.insert_one(dict(zone))
     _cache_zone["zone"], _cache_zone["charge"] = zone, True
 
-    # Vérification immédiate de la dernière position de chaque animal
     for animal_id in positions.distinct("animal_id"):
         d = positions.find_one({"animal_id": animal_id}, sort=[("timestamp", -1)])
         if d:
-            verifier_pature(Position(**{k: d[k] for k in Position.model_fields}))
+            try:
+                verifier_pature(Position(**{k: d[k] for k in Position.model_fields}))
+            except Exception as e:
+                print(f"Vérification initiale ignorée : {e}")
     diffuseur.publier({"type": "pature", "data": {
         "name": zone["name"], "coordinates": zone["coordinates"]}})
     return {"statut": "ok", "sommets": len(sommets)}
@@ -390,12 +385,15 @@ def creer_pature(donnees: dict):
 
 @app.get("/pastures")
 def lire_pature():
-    return zone_active() or {"statut": "aucune zone"}
+    zone = zone_active()
+    if not zone:
+        return {"statut": "aucune zone"}
+    return {"name": zone["name"], "coordinates": zone["coordinates"]}
 
 
 @app.delete("/pastures")
 def supprimer_pature():
-    """Désactive la zone, résout les alertes hors_pature et prévient les clients."""
+    """Désactive la zone, résout les alertes hors_pature, prévient les clients."""
     pasture.update_many({"active": True}, {"$set": {"active": False}})
     _cache_zone["zone"], _cache_zone["charge"] = None, True
 
@@ -419,14 +417,12 @@ def supprimer_pature():
 
 @app.get("/positions")
 def lire_positions(animal_id: Optional[str] = None, limite: int = 50):
-    """Retourne les dernières positions enregistrées (filtrables par animal)."""
     filtre = {"animal_id": animal_id} if animal_id else {}
     return list(positions.find(filtre, {"_id": 0}).sort("timestamp", -1).limit(limite))
 
 
 @app.get("/alertes")
 def lire_alertes(animal_id: Optional[str] = None, actives: bool = False, limite: int = 50):
-    """Retourne les dernières alertes (filtrables par animal, ou seulement les actives)."""
     filtre = {}
     if animal_id:
         filtre["animal_id"] = animal_id
@@ -437,7 +433,6 @@ def lire_alertes(animal_id: Optional[str] = None, actives: bool = False, limite:
 
 @app.get("/troupeau")
 def etat_troupeau():
-    """Grand troupeau, autres groupes, écarts et nombre d'animaux en alerte."""
     derniere = positions.find_one({}, {"_id": 0}, sort=[("timestamp", -1)])
     if not derniere:
         return {"statut": "aucune donnée"}
@@ -463,7 +458,6 @@ def etat_troupeau():
 
 @app.get("/sante/{animal_id}")
 def sante(animal_id: str):
-    """Écarts de comportement d'un animal par rapport à sa propre habitude."""
     maintenant = datetime.now(timezone.utc)
     fin = maintenant.replace(hour=0, minute=0, second=0, microsecond=0)
     debut = fin - timedelta(days=JOURS_REFERENCE + JOURS_EVALUATION)
@@ -478,7 +472,7 @@ def sante(animal_id: str):
 
 
 def etat_complet() -> dict:
-    """Photo de départ envoyée à chaque nouveau client."""
+    """Photo de départ envoyée à chaque nouveau client WebSocket."""
     dernieres = []
     for animal_id in positions.distinct("animal_id"):
         doc = positions.find_one(
@@ -506,9 +500,9 @@ async def ws_endpoint(ws: WebSocket):
     try:
         etat = await asyncio.to_thread(etat_complet)
         await ws.send_text(json.dumps(etat, default=_json))
-        diffuseur.clients.add(ws)           # après l'état : pas d'événement avant lui
+        diffuseur.clients.add(ws)
         while True:
-            await ws.receive_text()         # le client envoie "ping" pour garder la ligne
+            await ws.receive_text()
     except WebSocketDisconnect:
         pass
     finally:
