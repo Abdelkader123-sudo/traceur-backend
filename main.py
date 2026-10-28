@@ -12,8 +12,8 @@ from pydantic import BaseModel, ValidationError
 from pymongo import MongoClient
 
 from analyse import analyser_troupeaux, deplacement_inhabituel, est_immobile
-from params import BORNES, DEFAUTS, valider_parametres
 from geofence import analyser_point, valider_sommets
+from params import BORNES, DEFAUTS, valider_parametres
 from sante import JOURS_EVALUATION, JOURS_REFERENCE, evaluer_sante
 
 MQTT_HOST = os.getenv("MQTT_HOST", "ycf81881.ala.eu-central-1.emqxsl.com")
@@ -35,7 +35,9 @@ etat_animaux = base["etat_animaux"]
 animaux = base["animaux"]
 pasture = base["pastures"]
 parametres_col = base["parametres"]
+
 _cache_params = {"v": None}
+_cache_zone = {"zone": None, "charge": False}
 
 
 def P() -> dict:
@@ -44,7 +46,6 @@ def P() -> dict:
         doc = parametres_col.find_one({"_id": "global"}) or {}
         _cache_params["v"] = {**DEFAUTS, **{k: doc[k] for k in DEFAUTS if k in doc}}
     return _cache_params["v"]
-_cache_zone = {"zone": None, "charge": False}
 
 
 def zone_active():
@@ -187,6 +188,9 @@ def verifier_troupeau(p):
     gerer_alerte(p.animal_id, "sortie_zone", alerte, message, p)
 
 
+# ---------------------------------------------------------------------------
+# Géorepérage
+# ---------------------------------------------------------------------------
 def verifier_pature(p):
     zone = zone_active()
     if not zone:
@@ -200,6 +204,9 @@ def verifier_pature(p):
     )
 
 
+# ---------------------------------------------------------------------------
+# Alertes individuelles
+# ---------------------------------------------------------------------------
 def verifier_alertes_individuelles(p):
     prm = P()
     duree = prm["duree_immobilite_s"]
@@ -226,6 +233,9 @@ def verifier_alertes_individuelles(p):
         f"Vitesse supérieure à {prm['vitesse_max']} km/h sur {nb} mesures", p)
 
 
+# ---------------------------------------------------------------------------
+# Collier silencieux
+# ---------------------------------------------------------------------------
 def verifier_colliers():
     delai = P()["delai_collier_s"]
     maintenant = datetime.now(timezone.utc)
@@ -239,6 +249,7 @@ def verifier_colliers():
         gerer_alerte(animal_id, "collier_silencieux", age > delai,
                      f"Aucun message depuis plus de {delai // 60} min",
                      Position(**doc))
+
 
 async def surveillance_colliers():
     while True:
@@ -322,7 +333,7 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST", "DELETE","PUT"],
+    allow_methods=["GET", "POST", "DELETE", "PUT"],
     allow_headers=["*"],
 )
 
@@ -406,15 +417,16 @@ def lire_alertes(animal_id: Optional[str] = None, actives: bool = False, limite:
 
 @app.get("/troupeau")
 def etat_troupeau():
+    prm = P()
     derniere = positions.find_one({}, {"_id": 0}, sort=[("timestamp", -1)])
     if not derniere:
         return {"statut": "aucune donnée"}
     reference = derniere["timestamp"]
     actuelles = positions_actuelles(reference)
-    if len(actuelles) < MIN_ANIMAUX_TROUPEAU:
+    if len(actuelles) < prm["min_animaux_troupeau"]:
         return {"statut": "pas assez d'animaux actifs", "animaux_actifs": len(actuelles)}
-    principal, autres, _ = analyser_troupeaux(actuelles)
-    limite = reference - timedelta(seconds=FRAICHEUR_S)
+    principal, autres, _ = analyser_troupeaux(actuelles, prm)
+    limite = reference - timedelta(seconds=prm["fraicheur_s"])
     en_alerte = list(etat_animaux.find(
         {"alerte": True, "derniere_mesure": {"$gte": limite}},
         {"_id": 0, "animal_id": 1, "ecart_m": 1},
@@ -442,6 +454,31 @@ def sante(animal_id: str):
     resultat = evaluer_sante(mesures, fiche, maintenant)
     resultat["animal_id"] = animal_id
     return resultat
+
+
+@app.get("/parametres")
+def lire_parametres():
+    return {"valeurs": P(), "defauts": DEFAUTS,
+            "bornes": {k: [b[0], b[1]] for k, b in BORNES.items()}}
+
+
+@app.put("/parametres")
+def modifier_parametres(donnees: dict):
+    try:
+        propres = valider_parametres(donnees)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    nouveaux = {**P(), **propres}
+    parametres_col.update_one({"_id": "global"}, {"$set": nouveaux}, upsert=True)
+    _cache_params["v"] = nouveaux
+    return {"statut": "ok", "valeurs": nouveaux}
+
+
+@app.post("/parametres/reinitialiser")
+def reinitialiser_parametres():
+    parametres_col.delete_one({"_id": "global"})
+    _cache_params["v"] = dict(DEFAUTS)
+    return {"statut": "ok", "valeurs": DEFAUTS}
 
 
 def etat_complet() -> dict:
@@ -480,27 +517,3 @@ async def ws_endpoint(ws: WebSocket):
         pass
     finally:
         diffuseur.clients.discard(ws)
-
-@app.get("/parametres")
-def lire_parametres():
-    return {"valeurs": P(), "defauts": DEFAUTS,
-            "bornes": {k: [b[0], b[1]] for k, b in BORNES.items()}}
-
-
-@app.put("/parametres")
-def modifier_parametres(donnees: dict):
-    try:
-        propres = valider_parametres(donnees)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    nouveaux = {**P(), **propres}
-    parametres_col.update_one({"_id": "global"}, {"$set": nouveaux}, upsert=True)
-    _cache_params["v"] = nouveaux
-    return {"statut": "ok", "valeurs": nouveaux}
-
-
-@app.post("/parametres/reinitialiser")
-def reinitialiser_parametres():
-    parametres_col.delete_one({"_id": "global"})
-    _cache_params["v"] = dict(DEFAUTS)
-    return {"statut": "ok", "valeurs": DEFAUTS}
