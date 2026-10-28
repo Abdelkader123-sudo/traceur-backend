@@ -7,7 +7,7 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
+COPY main.py analyse.py sante.py geofence.py params.py emqxsl-ca.crt ./
 COPY main.py analyse.py sante.py geofence.py emqxsl-ca.crt ./
 
 RUN useradd -m appuser
