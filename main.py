@@ -11,19 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ValidationError
 from pymongo import MongoClient
 
-from analyse import (
-    DELAI_COLLIER_S,
-    DISTANCE_ALERTE_M,
-    DUREE_IMMOBILITE_S,
-    FRAICHEUR_S,
-    MIN_ANIMAUX_TROUPEAU,
-    NB_CONFIRMATIONS,
-    NB_MESURES_VITESSE,
-    VITESSE_MAX,
-    analyser_troupeaux,
-    deplacement_inhabituel,
-    est_immobile,
-)
+from analyse import analyser_troupeaux, deplacement_inhabituel, est_immobile
+from params import BORNES, DEFAUTS, valider_parametres
 from geofence import analyser_point, valider_sommets
 from sante import JOURS_EVALUATION, JOURS_REFERENCE, evaluer_sante
 
@@ -37,7 +26,6 @@ CA_FILE = os.getenv("CA_FILE", "emqxsl-ca.crt")
 MONGO_URI = os.environ["MONGO_URI"]
 
 INTERVALLE_VERIF_COLLIERS_S = 60   # vérification des colliers silencieux
-MARGE_PATURE_M = 10   # tolérance GPS hors zone (EXPÉRIMENTAL)
 
 mongo_client = MongoClient(MONGO_URI, tz_aware=True)
 base = mongo_client["traceur_gps"]
@@ -46,7 +34,16 @@ alerts = base["alerts"]
 etat_animaux = base["etat_animaux"]
 animaux = base["animaux"]
 pasture = base["pastures"]
+parametres_col = base["parametres"]
+_cache_params = {"v": None}
 
+
+def P() -> dict:
+    """Paramètres actifs (défauts + valeurs enregistrées par l'utilisateur)."""
+    if _cache_params["v"] is None:
+        doc = parametres_col.find_one({"_id": "global"}) or {}
+        _cache_params["v"] = {**DEFAUTS, **{k: doc[k] for k in DEFAUTS if k in doc}}
+    return _cache_params["v"]
 _cache_zone = {"zone": None, "charge": False}
 
 
@@ -140,8 +137,7 @@ def gerer_alerte(animal_id, type_alerte, condition, message, position):
 # Troupeau
 # ---------------------------------------------------------------------------
 def positions_actuelles(reference):
-    """Dernière position de chaque animal, si elle date de moins de FRAICHEUR_S."""
-    limite = reference - timedelta(seconds=FRAICHEUR_S)
+    limite = reference - timedelta(seconds=P()["fraicheur_s"])
     resultat = []
     for animal_id in positions.distinct("animal_id"):
         doc = positions.find_one(
@@ -153,7 +149,7 @@ def positions_actuelles(reference):
 
 
 def nb_animaux_en_alerte(reference):
-    limite = reference - timedelta(seconds=FRAICHEUR_S)
+    limite = reference - timedelta(seconds=P()["fraicheur_s"])
     return etat_animaux.count_documents(
         {"alerte": True, "derniere_mesure": {"$gte": limite}}
     )
@@ -161,111 +157,88 @@ def nb_animaux_en_alerte(reference):
 
 def verifier_troupeau(p):
     """Sortie de zone du troupeau, confirmée sur plusieurs messages."""
+    prm = P()
     actuelles = positions_actuelles(p.timestamp)
-    if len(actuelles) < MIN_ANIMAUX_TROUPEAU:
+    if len(actuelles) < prm["min_animaux_troupeau"]:
         return
-    _, _, ecarts = analyser_troupeaux(actuelles)
+    principal, autres, ecarts = analyser_troupeaux(actuelles, prm)
+    diffuseur.publier({"type": "troupeau", "data": {
+        "statut": "ok", "animaux_actifs": len(actuelles),
+        "grand_troupeau": principal, "autres_groupes": autres}})
 
     ecart = ecarts.get(p.animal_id)
-    hors = ecart is not None and ecart > DISTANCE_ALERTE_M
+    hors = ecart is not None and ecart > prm["distance_alerte_m"]
 
     etat = etat_animaux.find_one({"animal_id": p.animal_id}) or {}
     nb_hors = etat.get("nb_hors_zone", 0) + 1 if hors else 0
-    alerte = nb_hors >= NB_CONFIRMATIONS
+    alerte = nb_hors >= prm["nb_confirmations"]
 
     etat_animaux.update_one(
         {"animal_id": p.animal_id},
-        {"$set": {
-            "nb_hors_zone": nb_hors,
-            "alerte": alerte,
-            "ecart_m": ecart if ecart is not None else 0.0,
-            "derniere_mesure": p.timestamp,
-        }},
+        {"$set": {"nb_hors_zone": nb_hors, "alerte": alerte,
+                  "ecart_m": ecart if ecart is not None else 0.0,
+                  "derniere_mesure": p.timestamp}},
         upsert=True,
     )
-
     total = nb_animaux_en_alerte(p.timestamp)
-    message = (
-        f"À {round(ecart or 0)} m du grand troupeau "
-        f"(confirmé sur {NB_CONFIRMATIONS} mesures). "
-        f"Animaux hors zone : {total}"
-    )
+    message = (f"À {round(ecart or 0)} m du grand troupeau "
+               f"(confirmé sur {prm['nb_confirmations']} mesures). "
+               f"Animaux hors zone : {total}")
     gerer_alerte(p.animal_id, "sortie_zone", alerte, message, p)
 
 
-# ---------------------------------------------------------------------------
-# Géorepérage
-# ---------------------------------------------------------------------------
 def verifier_pature(p):
-    """Alerte hors_pature si l'animal est à plus de MARGE_PATURE_M hors de la zone."""
     zone = zone_active()
     if not zone:
         return
     sommets = [(c["latitude"], c["longitude"]) for c in zone["coordinates"]]
     dedans, bord = analyser_point(p.lat, p.lon, sommets)
-    hors = (not dedans) and bord > MARGE_PATURE_M
+    hors = (not dedans) and bord > P()["marge_pature_m"]
     gerer_alerte(
         p.animal_id, "hors_pature", hors,
         f"Hors de la zone « {zone['name']} », à {round(bord)} m du bord", p,
     )
 
 
-# ---------------------------------------------------------------------------
-# Alertes individuelles
-# ---------------------------------------------------------------------------
 def verifier_alertes_individuelles(p):
-    """Immobilité prolongée et déplacement inhabituel."""
-    debut = p.timestamp - timedelta(seconds=DUREE_IMMOBILITE_S)
-    fenetre = list(
-        positions.find(
-            {"animal_id": p.animal_id, "timestamp": {"$gte": debut, "$lte": p.timestamp}},
-            {"_id": 0},
-        ).sort("timestamp", 1)
-    )
+    prm = P()
+    duree = prm["duree_immobilite_s"]
+    debut = p.timestamp - timedelta(seconds=duree)
+    fenetre = list(positions.find(
+        {"animal_id": p.animal_id, "timestamp": {"$gte": debut, "$lte": p.timestamp}},
+        {"_id": 0}).sort("timestamp", 1))
     repere = positions.find_one(
         {"animal_id": p.animal_id, "timestamp": {"$lt": debut}},
-        {"_id": 0},
-        sort=[("timestamp", -1)],
-    )
+        {"_id": 0}, sort=[("timestamp", -1)])
     if repere:
         fenetre.insert(0, repere)
     gerer_alerte(
-        p.animal_id, "immobilite", est_immobile(fenetre, DUREE_IMMOBILITE_S),
-        f"Au repos depuis plus de {DUREE_IMMOBILITE_S // 60} min", p,
-    )
+        p.animal_id, "immobilite",
+        est_immobile(fenetre, duree, prm["vitesse_repos_max"]),
+        f"Au repos depuis plus de {duree // 60} min", p)
 
-    dernieres = list(
-        positions.find({"animal_id": p.animal_id}, {"_id": 0})
-        .sort("timestamp", -1)
-        .limit(NB_MESURES_VITESSE)
-    )[::-1]
+    nb = prm["nb_mesures_vitesse"]
+    dernieres = list(positions.find({"animal_id": p.animal_id}, {"_id": 0})
+                     .sort("timestamp", -1).limit(nb))[::-1]
     gerer_alerte(
         p.animal_id, "deplacement_inhabituel",
-        deplacement_inhabituel(dernieres),
-        f"Vitesse supérieure à {VITESSE_MAX} km/h sur {NB_MESURES_VITESSE} mesures", p,
-    )
+        deplacement_inhabituel(dernieres, prm["vitesse_max"], nb),
+        f"Vitesse supérieure à {prm['vitesse_max']} km/h sur {nb} mesures", p)
 
 
-# ---------------------------------------------------------------------------
-# Collier silencieux
-# ---------------------------------------------------------------------------
 def verifier_colliers():
+    delai = P()["delai_collier_s"]
     maintenant = datetime.now(timezone.utc)
     for animal_id in positions.distinct("animal_id"):
         doc = positions.find_one(
-            {"animal_id": animal_id}, {"_id": 0}, sort=[("timestamp", -1)]
-        )
+            {"animal_id": animal_id}, {"_id": 0}, sort=[("timestamp", -1)])
         if not doc:
             continue
         age = (maintenant - doc["timestamp"]).total_seconds()
-        silencieux = age > DELAI_COLLIER_S
         doc["timestamp"] = maintenant
-        gerer_alerte(
-            animal_id, "collier_silencieux", silencieux,
-            f"Aucun message depuis plus de {DELAI_COLLIER_S // 60} min",
-            Position(**doc),
-        )
-
+        gerer_alerte(animal_id, "collier_silencieux", age > delai,
+                     f"Aucun message depuis plus de {delai // 60} min",
+                     Position(**doc))
 
 async def surveillance_colliers():
     while True:
@@ -349,7 +322,7 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST", "DELETE"],
+    allow_methods=["GET", "POST", "DELETE","PUT"],
     allow_headers=["*"],
 )
 
@@ -507,3 +480,27 @@ async def ws_endpoint(ws: WebSocket):
         pass
     finally:
         diffuseur.clients.discard(ws)
+
+@app.get("/parametres")
+def lire_parametres():
+    return {"valeurs": P(), "defauts": DEFAUTS,
+            "bornes": {k: [b[0], b[1]] for k, b in BORNES.items()}}
+
+
+@app.put("/parametres")
+def modifier_parametres(donnees: dict):
+    try:
+        propres = valider_parametres(donnees)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    nouveaux = {**P(), **propres}
+    parametres_col.update_one({"_id": "global"}, {"$set": nouveaux}, upsert=True)
+    _cache_params["v"] = nouveaux
+    return {"statut": "ok", "valeurs": nouveaux}
+
+
+@app.post("/parametres/reinitialiser")
+def reinitialiser_parametres():
+    parametres_col.delete_one({"_id": "global"})
+    _cache_params["v"] = dict(DEFAUTS)
+    return {"statut": "ok", "valeurs": DEFAUTS}

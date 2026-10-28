@@ -42,25 +42,18 @@ def _zone(coords, derniers, indices):
     }
 
 
-def analyser_troupeaux(derniers):
-    """Trouve le grand troupeau, les autres groupes et leur écart au grand troupeau.
-
-    Retourne (principal, autres, ecarts) :
-      - principal : zone du plus grand groupe
-      - autres : liste des autres groupes (type, zone, écart, dépasse le seuil)
-      - ecarts : dict animal_id -> écart (m) pour les animaux hors du grand troupeau
-    """
-    if len(derniers) < MIN_ANIMAUX_TROUPEAU:
+def analyser_troupeaux(derniers, p):
+    """p : dict de paramètres (eps_troupeau_m, min_animaux_troupeau, distance_alerte_m)."""
+    if len(derniers) < p["min_animaux_troupeau"]:
         return None, [], {}
 
-    coords = np.radians([[p["lat"], p["lon"]] for p in derniers])
+    coords = np.radians([[d["lat"], d["lon"]] for d in derniers])
     labels = DBSCAN(
-        eps=EPS_TROUPEAU_M / RAYON_TERRE_M,
+        eps=p["eps_troupeau_m"] / RAYON_TERRE_M,
         min_samples=2,
         metric="haversine",
     ).fit_predict(coords)
 
-    # Chaque animal isolé (-1) devient son propre groupe d'un animal
     suivant = int(labels.max()) + 1
     labels = list(labels)
     for i, l in enumerate(labels):
@@ -89,28 +82,26 @@ def analyser_troupeaux(derniers):
             "type": "troupeau" if len(indices) > 1 else "individuel",
             "zone": zone,
             "ecart_m": ecart,
-            "depasse_seuil": ecart > DISTANCE_ALERTE_M,
+            "depasse_seuil": ecart > p["distance_alerte_m"],
         })
         for animal_id in zone["animaux"]:
             ecarts[animal_id] = ecart
     return principal, autres, ecarts
 
 
-def est_immobile(mesures, duree_min_s=DUREE_IMMOBILITE_S):
-    """Vrai si l'animal est resté au repos sur toute la durée donnée."""
+def est_immobile(mesures, duree_min_s, vitesse_repos_max):
     if len(mesures) < 2:
         return False
     couverture = (mesures[-1]["timestamp"] - mesures[0]["timestamp"]).total_seconds()
     if couverture < duree_min_s:
         return False
     return all(
-        m["activite"] == "repos" and m["vitesse"] <= VITESSE_REPOS_MAX
+        m["activite"] == "repos" and m["vitesse"] <= vitesse_repos_max
         for m in mesures
     )
 
 
-def deplacement_inhabituel(mesures, vitesse_max=VITESSE_MAX, nb=NB_MESURES_VITESSE):
-    """Vrai si les 'nb' dernières mesures dépassent toutes la vitesse maximale."""
+def deplacement_inhabituel(mesures, vitesse_max, nb):
     if len(mesures) < nb:
         return False
     return all(m["vitesse"] >= vitesse_max for m in mesures[-nb:])
