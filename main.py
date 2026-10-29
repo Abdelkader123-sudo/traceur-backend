@@ -3,12 +3,12 @@ import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Literal, Optional                      # AJOUT INFO : Literal
 
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError    # AJOUT INFO : Field
 from pymongo import MongoClient
 
 from DBSCAN import analyser_troupeaux, deplacement_inhabituel, est_immobile
@@ -99,6 +99,14 @@ class Position(BaseModel):
     vitesse: float
     activite: str
     timestamp: datetime
+
+
+class InfoAnimal(BaseModel):                                   # AJOUT INFO
+    """Caractéristiques saisies par l'utilisateur (toutes facultatives)."""
+    type: Optional[str] = Field(default=None, max_length=40)
+    sexe: Optional[Literal["femelle", "male"]] = None
+    age_ans: Optional[float] = Field(default=None, ge=0, le=40)
+    poids_kg: Optional[float] = Field(default=None, gt=0, le=1500)
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +356,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(creer_router(mesures_activite, appliquer_alerte_ia))    # AJOUT IA : GET /ia/bilan
+
+
+# ---------------------------------------------------------------------------
+# Caractéristiques des animaux (AJOUT INFO)
+# ---------------------------------------------------------------------------
+@app.get("/animaux")
+def lire_animaux():
+    """Caractéristiques de tous les animaux renseignés."""
+    return list(animaux.find({"animal_id": {"$exists": True}}, {"_id": 0}))
+
+
+@app.get("/animaux/{animal_id}")
+def lire_animal(animal_id: str):
+    doc = animaux.find_one({"_id": animal_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Animal non renseigné")
+    return doc
+
+
+@app.put("/animaux/{animal_id}")
+def enregistrer_animal(animal_id: str, info: InfoAnimal):
+    """Crée ou met à jour les caractéristiques d'un animal.
+    Un champ envoyé à null est effacé ; un champ absent reste inchangé."""
+    animal_id = animal_id.strip()
+    if not animal_id or len(animal_id) > 60:
+        raise HTTPException(status_code=422, detail="Identifiant invalide")
+    champs = info.model_dump(exclude_unset=True)
+    if not champs:
+        raise HTTPException(status_code=422, detail="Aucune information à enregistrer")
+    if champs.get("type"):
+        champs["type"] = champs["type"].strip()
+    champs["animal_id"] = animal_id
+    champs["mis_a_jour"] = datetime.now(timezone.utc)
+    animaux.update_one({"_id": animal_id}, {"$set": champs}, upsert=True)
+    return animaux.find_one({"_id": animal_id}, {"_id": 0})
 
 
 @app.post("/pastures")
