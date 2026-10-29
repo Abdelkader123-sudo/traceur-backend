@@ -11,10 +11,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ValidationError
 from pymongo import MongoClient
 
-from analyse import analyser_troupeaux, deplacement_inhabituel, est_immobile
+from DBSCAN import analyser_troupeaux, deplacement_inhabituel, est_immobile
 from geofence import analyser_point, valider_sommets
+from IA.ia_routes import creer_router          # AJOUT IA
 from params import BORNES, DEFAUTS, valider_parametres
-from sante import JOURS_EVALUATION, JOURS_REFERENCE, evaluer_sante
 
 MQTT_HOST = os.getenv("MQTT_HOST", "ycf81881.ala.eu-central-1.emqxsl.com")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
@@ -35,6 +35,7 @@ etat_animaux = base["etat_animaux"]
 animaux = base["animaux"]
 pasture = base["pastures"]
 parametres_col = base["parametres"]
+mesures_activite = base["mesures_activite"]    # AJOUT IA : un document par animal et par minute (mi, steps)
 
 _cache_params = {"v": None}
 _cache_zone = {"zone": None, "charge": False}
@@ -132,6 +133,16 @@ def gerer_alerte(animal_id, type_alerte, condition, message, position):
             "type": type_alerte,
             "resolue_le": position.timestamp,
         }})
+
+
+def appliquer_alerte_ia(animal_id, condition, message):
+    """AJOUT IA : branche le bilan Isolation Forest sur le système d'alertes existant
+    (ouverture, résolution automatique, diffusion WebSocket), à la dernière position connue."""
+    doc = positions.find_one({"animal_id": animal_id}, {"_id": 0}, sort=[("timestamp", -1)])
+    if not doc:
+        return
+    doc["timestamp"] = datetime.now(timezone.utc)
+    gerer_alerte(animal_id, "comportement_inhabituel", condition, message, Position(**doc))
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +347,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE", "PUT"],
     allow_headers=["*"],
 )
+app.include_router(creer_router(mesures_activite, appliquer_alerte_ia))    # AJOUT IA : GET /ia/bilan
 
 
 @app.post("/pastures")
@@ -439,21 +451,6 @@ def etat_troupeau():
         "nb_animaux_en_alerte": len(en_alerte),
         "animaux_en_alerte": en_alerte,
     }
-
-
-@app.get("/sante/{animal_id}")
-def sante(animal_id: str):
-    maintenant = datetime.now(timezone.utc)
-    fin = maintenant.replace(hour=0, minute=0, second=0, microsecond=0)
-    debut = fin - timedelta(days=JOURS_REFERENCE + JOURS_EVALUATION)
-    mesures = list(positions.find(
-        {"animal_id": animal_id, "timestamp": {"$gte": debut, "$lt": fin}},
-        {"_id": 0},
-    ).sort("timestamp", 1))
-    fiche = animaux.find_one({"animal_id": animal_id}, {"_id": 0})
-    resultat = evaluer_sante(mesures, fiche, maintenant)
-    resultat["animal_id"] = animal_id
-    return resultat
 
 
 @app.get("/parametres")
