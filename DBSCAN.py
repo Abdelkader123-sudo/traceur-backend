@@ -4,22 +4,6 @@ from sklearn.metrics.pairwise import haversine_distances
 
 RAYON_TERRE_M = 6_371_000
 
-# --- Paramètres des troupeaux ---
-EPS_TROUPEAU_M = 30        # deux animaux à moins de 30 m sont voisins
-MIN_ANIMAUX_TROUPEAU = 5   # en dessous, pas d'analyse de zone
-FRAICHEUR_S = 420          # position ignorée au-delà de 7 min (envoi toutes les 2 min)
-DISTANCE_ALERTE_M = 120    # écart bord à bord avec le grand troupeau
-NB_CONFIRMATIONS = 2       # messages successifs du même animal hors zone avant alerte
-
-# --- Collier silencieux ---
-DELAI_COLLIER_S = 600      # aucun message depuis 10 min = collier en panne    
-
-# --- Paramètres de détection individuelle ---
-DUREE_IMMOBILITE_S = 1800  # 30 min au repos (mettre 300 pour tester)
-VITESSE_REPOS_MAX = 0.3    # km/h
-VITESSE_MAX = 5.0          # km/h
-NB_MESURES_VITESSE = 3
-
 
 def distance_m(lat1, lon1, lat2, lon2):
     """Distance en mètres entre deux points GPS (formule haversine)."""
