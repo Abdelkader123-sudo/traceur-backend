@@ -3,12 +3,12 @@ import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Literal, Optional
+from typing import Optional
 
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ValidationError
 from pymongo import MongoClient
 
 from DBSCAN import analyser_troupeaux, deplacement_inhabituel, est_immobile
@@ -26,7 +26,6 @@ CA_FILE = os.getenv("CA_FILE", "emqxsl-ca.crt")
 MONGO_URI = os.environ["MONGO_URI"]
 
 INTERVALLE_VERIF_COLLIERS_S = 60   # vérification des colliers silencieux
-SEUIL_BATTERIE_PCT = 20            # AJOUT SIM : alerte batterie_faible sous ce niveau
 
 mongo_client = MongoClient(MONGO_URI, tz_aware=True)
 base = mongo_client["traceur_gps"]
@@ -93,36 +92,13 @@ diffuseur = Diffuseur()
 
 
 class Position(BaseModel):
-    """Format attendu pour chaque message MQTT. Les champs après `timestamp`
-    sont facultatifs : les anciens colliers restent compatibles."""
+    """Format attendu pour chaque message MQTT."""
     animal_id: str
     lat: float
     lon: float
     vitesse: float
     activite: str
     timestamp: datetime
-    batterie: Optional[float] = None       # AJOUT SIM : niveau en %
-    satellites: Optional[int] = None       # AJOUT SIM
-    hdop: Optional[float] = None           # AJOUT SIM
-    mi: Optional[float] = None             # AJOUT SIM : intensité de mouvement (MPU6050)
-    steps: Optional[int] = None            # AJOUT SIM : pas depuis le dernier message
-    duree_s: Optional[float] = None        # AJOUT SIM : durée couverte par mi / steps
-
-
-# Ces champs vont dans mesures_activite, pas dans positions
-CHAMPS_ACTIVITE = {"mi", "steps", "duree_s"}   # AJOUT SIM
-
-
-def doc_position(p: Position) -> dict:         # AJOUT SIM
-    return p.model_dump(exclude=CHAMPS_ACTIVITE)
-
-
-class InfoAnimal(BaseModel):
-    """Caractéristiques saisies par l'utilisateur (toutes facultatives)."""
-    type: Optional[str] = Field(default=None, max_length=40)
-    sexe: Optional[Literal["femelle", "male"]] = None
-    age_ans: Optional[float] = Field(default=None, ge=0, le=40)
-    poids_kg: Optional[float] = Field(default=None, gt=0, le=1500)
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +172,10 @@ def verifier_troupeau(p):
     prm = P()
     actuelles = positions_actuelles(p.timestamp)
     if len(actuelles) < prm["min_animaux_troupeau"]:
+        # MODIFIÉ : on prévient les clients pour que la carte efface l'ancien groupe
+        diffuseur.publier({"type": "troupeau", "data": {
+            "statut": "pas assez d'animaux actifs",
+            "animaux_actifs": len(actuelles)}})
         return
     principal, autres, ecarts = analyser_troupeaux(actuelles, prm)
     diffuseur.publier({"type": "troupeau", "data": {
@@ -268,39 +248,6 @@ def verifier_alertes_individuelles(p):
         f"Vitesse supérieure à {prm['vitesse_max']} km/h sur {nb} mesures", p)
 
 
-def verifier_batterie(p):                      # AJOUT SIM
-    """Alerte quand la batterie du collier passe sous le seuil."""
-    if p.batterie is None:
-        return
-    gerer_alerte(
-        p.animal_id, "batterie_faible", p.batterie < SEUIL_BATTERIE_PCT,
-        f"Batterie faible : {round(p.batterie)} %", p)
-
-
-# ---------------------------------------------------------------------------
-# Mesures d'activité (MPU6050) pour l'IA
-# ---------------------------------------------------------------------------
-def enregistrer_mesure(p):                     # AJOUT SIM
-    """Agrège mi / steps par animal et par minute dans mesures_activite.
-    mi : moyenne pondérée par la durée ; steps : somme."""
-    if p.mi is None or p.steps is None:
-        return
-    duree = min(max(p.duree_s or 60.0, 1.0), 60.0)
-    minute = p.timestamp.astimezone(timezone.utc).replace(second=0, microsecond=0)
-    cle = {"animal_id": p.animal_id, "timestamp": minute}
-    doc = mesures_activite.find_one(cle)
-    if doc is None:
-        nouveau = {"mi": p.mi, "steps": p.steps, "duree_s": duree}
-    else:
-        total = doc["duree_s"] + duree
-        nouveau = {
-            "mi": (doc["mi"] * doc["duree_s"] + p.mi * duree) / total,
-            "steps": doc["steps"] + p.steps,
-            "duree_s": total,
-        }
-    mesures_activite.update_one(cle, {"$set": nouveau}, upsert=True)
-
-
 # ---------------------------------------------------------------------------
 # Collier silencieux
 # ---------------------------------------------------------------------------
@@ -351,14 +298,19 @@ def on_message(client, userdata, msg):
     if position.timestamp.tzinfo is None:
         position.timestamp = position.timestamp.replace(tzinfo=timezone.utc)
 
-    positions.insert_one(doc_position(position))
+    positions.insert_one(position.model_dump())
     print(f"Enregistré : {position.animal_id} ({position.lat}, {position.lon})")
-    diffuseur.publier({"type": "position", "data": doc_position(position)})
+    diffuseur.publier({"type": "position", "data": position.model_dump()})
 
-    try:
-        enregistrer_mesure(position)           # AJOUT SIM
-    except Exception as erreur:
-        print(f"Erreur enregistrer_mesure : {erreur}")
+    # AJOUT IA : activité du MPU6050 (mi, steps, duree_s) conservée pour le bilan Isolation Forest
+    if "mi" in data and "steps" in data:
+        try:
+            mesures_activite.insert_one({
+                "animal_id": position.animal_id, "timestamp": position.timestamp,
+                "mi": float(data["mi"]), "steps": float(data["steps"]),
+                "duree_s": float(data["duree_s"]) if data.get("duree_s") is not None else None})
+        except Exception as erreur:
+            print(f"Erreur mesures_activite : {erreur}")
 
     try:
         gerer_alerte(position.animal_id, "collier_silencieux", False, "", position)
@@ -366,7 +318,7 @@ def on_message(client, userdata, msg):
         print(f"Erreur collier_silencieux : {erreur}")
 
     for verification in (verifier_troupeau, verifier_pature,
-                         verifier_alertes_individuelles, verifier_batterie):
+                         verifier_alertes_individuelles):
         try:
             verification(position)
         except Exception as erreur:
@@ -390,11 +342,11 @@ async def lifespan(app: FastAPI):
         positions.create_index, [("animal_id", 1), ("timestamp", -1)]
     )
     await asyncio.to_thread(
-        mesures_activite.create_index, [("animal_id", 1), ("timestamp", -1)]   # AJOUT SIM
-    )
-    await asyncio.to_thread(
         etat_animaux.create_index, "animal_id", unique=True
     )
+    await asyncio.to_thread(
+        mesures_activite.create_index, [("animal_id", 1), ("timestamp", -1)]
+    )      # AJOUT IA
     mqtt_client.connect(MQTT_HOST, MQTT_PORT)
     mqtt_client.loop_start()
     tache = asyncio.create_task(surveillance_colliers())
@@ -413,41 +365,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(creer_router(mesures_activite, appliquer_alerte_ia))    # AJOUT IA : GET /ia/bilan
-
-
-# ---------------------------------------------------------------------------
-# Caractéristiques des animaux
-# ---------------------------------------------------------------------------
-@app.get("/animaux")
-def lire_animaux():
-    """Caractéristiques de tous les animaux renseignés."""
-    return list(animaux.find({"animal_id": {"$exists": True}}, {"_id": 0}))
-
-
-@app.get("/animaux/{animal_id}")
-def lire_animal(animal_id: str):
-    doc = animaux.find_one({"_id": animal_id}, {"_id": 0})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Animal non renseigné")
-    return doc
-
-
-@app.put("/animaux/{animal_id}")
-def enregistrer_animal(animal_id: str, info: InfoAnimal):
-    """Crée ou met à jour les caractéristiques d'un animal.
-    Un champ envoyé à null est effacé ; un champ absent reste inchangé."""
-    animal_id = animal_id.strip()
-    if not animal_id or len(animal_id) > 60:
-        raise HTTPException(status_code=422, detail="Identifiant invalide")
-    champs = info.model_dump(exclude_unset=True)
-    if not champs:
-        raise HTTPException(status_code=422, detail="Aucune information à enregistrer")
-    if champs.get("type"):
-        champs["type"] = champs["type"].strip()
-    champs["animal_id"] = animal_id
-    champs["mis_a_jour"] = datetime.now(timezone.utc)
-    animaux.update_one({"_id": animal_id}, {"$set": champs}, upsert=True)
-    return animaux.find_one({"_id": animal_id}, {"_id": 0})
 
 
 @app.post("/pastures")
@@ -471,8 +388,7 @@ def creer_pature(donnees: dict):
         d = positions.find_one({"animal_id": animal_id}, sort=[("timestamp", -1)])
         if d:
             try:
-                # AJOUT SIM : "if k in d" évite une erreur sur les anciens documents
-                verifier_pature(Position(**{k: d[k] for k in Position.model_fields if k in d}))
+                verifier_pature(Position(**{k: d[k] for k in Position.model_fields}))
             except Exception as e:
                 print(f"Vérification initiale ignorée : {e}")
     diffuseur.publier({"type": "pature", "data": {
@@ -554,6 +470,14 @@ def etat_troupeau():
     }
 
 
+def rediffuser_troupeau():
+    """AJOUT : recalcule le troupeau avec les paramètres actuels et prévient les clients."""
+    try:
+        diffuseur.publier({"type": "troupeau", "data": etat_troupeau()})
+    except Exception as e:
+        print(f"Rediffusion troupeau ignorée : {e}")
+
+
 @app.get("/parametres")
 def lire_parametres():
     return {"valeurs": P(), "defauts": DEFAUTS,
@@ -569,6 +493,7 @@ def modifier_parametres(donnees: dict):
     nouveaux = {**P(), **propres}
     parametres_col.update_one({"_id": "global"}, {"$set": nouveaux}, upsert=True)
     _cache_params["v"] = nouveaux
+    rediffuser_troupeau()                      # AJOUT
     return {"statut": "ok", "valeurs": nouveaux}
 
 
@@ -576,6 +501,7 @@ def modifier_parametres(donnees: dict):
 def reinitialiser_parametres():
     parametres_col.delete_one({"_id": "global"})
     _cache_params["v"] = dict(DEFAUTS)
+    rediffuser_troupeau()                      # AJOUT
     return {"statut": "ok", "valeurs": DEFAUTS}
 
 
