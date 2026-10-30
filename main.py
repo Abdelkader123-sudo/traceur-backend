@@ -167,26 +167,35 @@ def nb_animaux_en_alerte(reference):
     )
 
 
-def verifier_troupeau(p):
-    """Sortie de zone du troupeau, confirmée sur plusieurs messages."""
+def verifier_troupeau(p, reevaluation=False):
+    """Sortie de zone du troupeau, confirmée sur plusieurs messages.
+
+    reevaluation=True : appelé après un changement de paramètres.
+    - pas de diffusion du troupeau ici (faite une seule fois à la fin)
+    - la confirmation est immédiate (on juge la dernière position telle quelle)
+    """
     prm = P()
     actuelles = positions_actuelles(p.timestamp)
     if len(actuelles) < prm["min_animaux_troupeau"]:
-        # MODIFIÉ : on prévient les clients pour que la carte efface l'ancien groupe
-        diffuseur.publier({"type": "troupeau", "data": {
-            "statut": "pas assez d'animaux actifs",
-            "animaux_actifs": len(actuelles)}})
+        if not reevaluation:
+            diffuseur.publier({"type": "troupeau", "data": {
+                "statut": "pas assez d'animaux actifs",
+                "animaux_actifs": len(actuelles)}})
         return
     principal, autres, ecarts = analyser_troupeaux(actuelles, prm)
-    diffuseur.publier({"type": "troupeau", "data": {
-        "statut": "ok", "animaux_actifs": len(actuelles),
-        "grand_troupeau": principal, "autres_groupes": autres}})
+    if not reevaluation:
+        diffuseur.publier({"type": "troupeau", "data": {
+            "statut": "ok", "animaux_actifs": len(actuelles),
+            "grand_troupeau": principal, "autres_groupes": autres}})
 
     ecart = ecarts.get(p.animal_id)
     hors = ecart is not None and ecart > prm["distance_alerte_m"]
 
     etat = etat_animaux.find_one({"animal_id": p.animal_id}) or {}
-    nb_hors = etat.get("nb_hors_zone", 0) + 1 if hors else 0
+    if reevaluation:
+        nb_hors = prm["nb_confirmations"] if hors else 0
+    else:
+        nb_hors = etat.get("nb_hors_zone", 0) + 1 if hors else 0
     alerte = nb_hors >= prm["nb_confirmations"]
 
     etat_animaux.update_one(
@@ -471,11 +480,40 @@ def etat_troupeau():
 
 
 def rediffuser_troupeau():
-    """AJOUT : recalcule le troupeau avec les paramètres actuels et prévient les clients."""
+    """Recalcule le troupeau avec les paramètres actuels et prévient les clients."""
     try:
         diffuseur.publier({"type": "troupeau", "data": etat_troupeau()})
     except Exception as e:
         print(f"Rediffusion troupeau ignorée : {e}")
+
+
+def reevaluer_tous():
+    """AJOUT : rejoue toutes les vérifications sur la dernière position de
+    chaque animal avec les nouveaux paramètres, sans attendre le prochain
+    message MQTT. Alertes ouvertes/fermées et diffusées immédiatement."""
+    for animal_id in positions.distinct("animal_id"):
+        d = positions.find_one({"animal_id": animal_id}, sort=[("timestamp", -1)])
+        if not d:
+            continue
+        try:
+            p = Position(**{k: d[k] for k in Position.model_fields})
+        except Exception as e:
+            print(f"Réévaluation ignorée ({animal_id}) : {e}")
+            continue
+        try:
+            verifier_troupeau(p, reevaluation=True)
+        except Exception as e:
+            print(f"Erreur verifier_troupeau : {e}")
+        for verification in (verifier_pature, verifier_alertes_individuelles):
+            try:
+                verification(p)
+            except Exception as e:
+                print(f"Erreur {verification.__name__} : {e}")
+    try:
+        verifier_colliers()
+    except Exception as e:
+        print(f"Erreur verifier_colliers : {e}")
+    rediffuser_troupeau()   # une seule diffusion, après les alertes
 
 
 @app.get("/parametres")
@@ -493,7 +531,7 @@ def modifier_parametres(donnees: dict):
     nouveaux = {**P(), **propres}
     parametres_col.update_one({"_id": "global"}, {"$set": nouveaux}, upsert=True)
     _cache_params["v"] = nouveaux
-    rediffuser_troupeau()                      # AJOUT
+    reevaluer_tous()                           # MODIFIÉ
     return {"statut": "ok", "valeurs": nouveaux}
 
 
@@ -501,7 +539,7 @@ def modifier_parametres(donnees: dict):
 def reinitialiser_parametres():
     parametres_col.delete_one({"_id": "global"})
     _cache_params["v"] = dict(DEFAUTS)
-    rediffuser_troupeau()                      # AJOUT
+    reevaluer_tous()                           # MODIFIÉ
     return {"statut": "ok", "valeurs": DEFAUTS}
 
 
