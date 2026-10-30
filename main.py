@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import paho.mqtt.client as mqtt
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ValidationError
 from pymongo import MongoClient
@@ -523,7 +523,7 @@ def lire_parametres():
 
 
 @app.put("/parametres")
-def modifier_parametres(donnees: dict):
+def modifier_parametres(donnees: dict, taches: BackgroundTasks):
     try:
         propres = valider_parametres(donnees)
     except ValueError as e:
@@ -531,15 +531,15 @@ def modifier_parametres(donnees: dict):
     nouveaux = {**P(), **propres}
     parametres_col.update_one({"_id": "global"}, {"$set": nouveaux}, upsert=True)
     _cache_params["v"] = nouveaux
-    reevaluer_tous()                           # MODIFIÉ
+    taches.add_task(reevaluer_tous)            # MODIFIÉ : après la réponse
     return {"statut": "ok", "valeurs": nouveaux}
 
 
 @app.post("/parametres/reinitialiser")
-def reinitialiser_parametres():
+def reinitialiser_parametres(taches: BackgroundTasks):
     parametres_col.delete_one({"_id": "global"})
     _cache_params["v"] = dict(DEFAUTS)
-    reevaluer_tous()                           # MODIFIÉ
+    taches.add_task(reevaluer_tous)            # MODIFIÉ : après la réponse
     return {"statut": "ok", "valeurs": DEFAUTS}
 
 
