@@ -15,9 +15,12 @@ Routes :
     GET /ia/bilan?heures=240               -> fenêtre d'historique plus longue (référence plus stable)
     GET /ia/historique/{animal_id}         -> courbe heure par heure : pas, routine attendue, score, anomalie
     GET /ia/historique/{animal_id}?heures=336
+    GET /ia/historique/{animal_id}?debut=2026-10-24&fin=2026-10-28
+                                   -> plage de dates (heure locale ; fin EXCLUE, 30 jours max)
 """
 import os
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import joblib
 import numpy as np
@@ -37,6 +40,7 @@ FUSEAU = os.getenv("IA_FUSEAU", "Africa/Tunis")     # fuseau LOCAL de l'élevage
 SEUIL_HEURES_ALERTE = 3      # nb d'heures en alerte sur 24 h pour classer « à surveiller » (valeur de départ, non validée)
 HEURES_DEFAUT = 168          # 7 jours d'historique : référence personnelle plus stable
 HEURES_MAX = 720             # 30 jours : limite pour éviter des calculs trop lourds
+HEURES_CONTEXTE = 168        # historique chargé AVANT la date de début choisie, pour calculer la routine
 HEURES_MIN = MIN_HEURES_REF + 24   # 96 h : 72 h valides + ~18 h perdues par la moyenne glissante sur 24 h
 _bundle = None
 
@@ -51,10 +55,20 @@ def charger_modele():
     return _bundle
 
 
-def lire_mesures(mesures, heures, animal_id=None):
-    """Lit les mesures récentes dans MongoDB, au format attendu par scorer()."""
-    debut = datetime.now(timezone.utc) - timedelta(hours=heures)
-    filtre = {"timestamp": {"$gte": debut}}
+def _vers_utc(t_local):
+    """Timestamp naïf en heure locale de l'élevage -> datetime UTC."""
+    return t_local.tz_localize(FUSEAU).tz_convert("UTC").to_pydatetime()
+
+
+def lire_mesures(mesures, heures=None, animal_id=None, debut_local=None, fin_local=None):
+    """Lit les mesures dans MongoDB, au format attendu par scorer().
+
+    Soit les `heures` dernières heures, soit la plage [debut_local, fin_local) en heure locale."""
+    if debut_local is not None:
+        filtre = {"timestamp": {"$gte": _vers_utc(debut_local), "$lt": _vers_utc(fin_local)}}
+    else:
+        debut = datetime.now(timezone.utc) - timedelta(hours=heures)
+        filtre = {"timestamp": {"$gte": debut}}
     if animal_id:
         filtre["animal_id"] = animal_id
     docs = list(mesures.find(filtre,
@@ -93,20 +107,32 @@ def _nb(x, n=2):
     return None if x is None or pd.isna(x) else round(float(x), n)
 
 
-def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT):
+def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fin=None):
     """Courbe heure par heure d'UN animal. Retourne None s'il n'a aucune mesure.
+
+    Deux modes : les `heures` dernières heures, ou la plage [debut, fin) (pd.Timestamp locaux).
+    En mode plage, on charge HEURES_CONTEXTE heures AVANT `debut` pour calculer la routine,
+    puis on ne renvoie que les heures de la plage demandée.
 
     Pour chaque heure : pas et mouvement mesurés, pas attendus (routine de l'animal à cette heure),
     score d'anomalie et indicateur d'anomalie. Les heures invalides (trop peu de messages) ont
     valide=False et aucune valeur : à afficher en gris, pas en zéro."""
     bundle = charger_modele()
-    df = lire_mesures(mesures, heures, animal_id)
+    if debut is not None:
+        df = lire_mesures(mesures, animal_id=animal_id, fin_local=fin,
+                          debut_local=debut - pd.Timedelta(hours=HEURES_CONTEXTE))
+    else:
+        df = lire_mesures(mesures, heures, animal_id)
     if df.empty:
         return None
 
     brut = agreger_horaire(df)                                   # toutes les heures, NaN si invalide
     brut = brut[["timestamp", "steps", "mi"]]
     nb_valides = int(brut["steps"].notna().sum())
+    if debut is not None:                                        # on n'affiche que la plage demandée
+        brut = brut[(brut["timestamp"] >= debut) & (brut["timestamp"] < fin)]
+        if brut.empty:
+            return None
 
     X = pd.DataFrame()
     if nb_valides >= MIN_HEURES_REF:
@@ -182,18 +208,35 @@ def creer_router(mesures, appliquer_alerte=None):
                 "alertes_mises_a_jour": enregistrer}
 
     @router.get("/historique/{animal_id}")
-    def historique(animal_id: str, heures: int = HEURES_DEFAUT):
-        """Historique d'activité heure par heure d'un animal, avec les heures anormales."""
-        if heures < HEURES_MIN or heures > HEURES_MAX:
+    def historique(animal_id: str, heures: int = HEURES_DEFAUT,
+                   debut: Optional[str] = None, fin: Optional[str] = None):
+        """Historique d'activité heure par heure d'un animal, avec les heures anormales.
+
+        Soit `heures` (dernières heures), soit `debut` et `fin` (dates locales, fin EXCLUE)."""
+        d = f = None
+        if (debut is None) != (fin is None):
+            raise HTTPException(400, "debut et fin doivent être fournis ensemble.")
+        if debut is not None:
+            try:
+                d, f = pd.Timestamp(debut), pd.Timestamp(fin)
+                d = d.tz_localize(None) if d.tzinfo else d
+                f = f.tz_localize(None) if f.tzinfo else f
+            except (ValueError, TypeError):
+                raise HTTPException(400, "Dates invalides (format attendu : AAAA-MM-JJ).")
+            if f <= d:
+                raise HTTPException(400, "fin doit être postérieure à debut.")
+            if f - d > pd.Timedelta(hours=HEURES_MAX):
+                raise HTTPException(400, f"Période limitée à {HEURES_MAX // 24} jours.")
+        elif heures < HEURES_MIN or heures > HEURES_MAX:
             raise HTTPException(400, f"heures doit être compris entre {HEURES_MIN} et {HEURES_MAX} (reçu : {heures}).")
         try:
-            res = calculer_historique(mesures, animal_id, heures)
+            res = calculer_historique(mesures, animal_id, heures, d, f)
         except FileNotFoundError:
             raise HTTPException(503, "Modèle introuvable : lancer entrainer_modele_final.py d'abord.")
         except ValueError as e:
             raise HTTPException(503, str(e))
         if res is None:
-            raise HTTPException(404, f"Aucune mesure récente pour {animal_id}.")
+            raise HTTPException(404, f"Aucune mesure pour {animal_id} sur cette période.")
         return res
 
     return router
