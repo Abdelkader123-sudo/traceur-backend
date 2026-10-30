@@ -3,12 +3,12 @@ import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Literal, Optional                      # AJOUT INFO : Literal
+from typing import Literal, Optional
 
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, ValidationError    # AJOUT INFO : Field
+from pydantic import BaseModel, Field, ValidationError
 from pymongo import MongoClient
 
 from DBSCAN import analyser_troupeaux, deplacement_inhabituel, est_immobile
@@ -26,6 +26,7 @@ CA_FILE = os.getenv("CA_FILE", "emqxsl-ca.crt")
 MONGO_URI = os.environ["MONGO_URI"]
 
 INTERVALLE_VERIF_COLLIERS_S = 60   # vérification des colliers silencieux
+SEUIL_BATTERIE_PCT = 20            # AJOUT SIM : alerte batterie_faible sous ce niveau
 
 mongo_client = MongoClient(MONGO_URI, tz_aware=True)
 base = mongo_client["traceur_gps"]
@@ -92,16 +93,31 @@ diffuseur = Diffuseur()
 
 
 class Position(BaseModel):
-    """Format attendu pour chaque message MQTT."""
+    """Format attendu pour chaque message MQTT. Les champs après `timestamp`
+    sont facultatifs : les anciens colliers restent compatibles."""
     animal_id: str
     lat: float
     lon: float
     vitesse: float
     activite: str
     timestamp: datetime
+    batterie: Optional[float] = None       # AJOUT SIM : niveau en %
+    satellites: Optional[int] = None       # AJOUT SIM
+    hdop: Optional[float] = None           # AJOUT SIM
+    mi: Optional[float] = None             # AJOUT SIM : intensité de mouvement (MPU6050)
+    steps: Optional[int] = None            # AJOUT SIM : pas depuis le dernier message
+    duree_s: Optional[float] = None        # AJOUT SIM : durée couverte par mi / steps
 
 
-class InfoAnimal(BaseModel):                                   # AJOUT INFO
+# Ces champs vont dans mesures_activite, pas dans positions
+CHAMPS_ACTIVITE = {"mi", "steps", "duree_s"}   # AJOUT SIM
+
+
+def doc_position(p: Position) -> dict:         # AJOUT SIM
+    return p.model_dump(exclude=CHAMPS_ACTIVITE)
+
+
+class InfoAnimal(BaseModel):
     """Caractéristiques saisies par l'utilisateur (toutes facultatives)."""
     type: Optional[str] = Field(default=None, max_length=40)
     sexe: Optional[Literal["femelle", "male"]] = None
@@ -252,6 +268,39 @@ def verifier_alertes_individuelles(p):
         f"Vitesse supérieure à {prm['vitesse_max']} km/h sur {nb} mesures", p)
 
 
+def verifier_batterie(p):                      # AJOUT SIM
+    """Alerte quand la batterie du collier passe sous le seuil."""
+    if p.batterie is None:
+        return
+    gerer_alerte(
+        p.animal_id, "batterie_faible", p.batterie < SEUIL_BATTERIE_PCT,
+        f"Batterie faible : {round(p.batterie)} %", p)
+
+
+# ---------------------------------------------------------------------------
+# Mesures d'activité (MPU6050) pour l'IA
+# ---------------------------------------------------------------------------
+def enregistrer_mesure(p):                     # AJOUT SIM
+    """Agrège mi / steps par animal et par minute dans mesures_activite.
+    mi : moyenne pondérée par la durée ; steps : somme."""
+    if p.mi is None or p.steps is None:
+        return
+    duree = min(max(p.duree_s or 60.0, 1.0), 60.0)
+    minute = p.timestamp.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    cle = {"animal_id": p.animal_id, "timestamp": minute}
+    doc = mesures_activite.find_one(cle)
+    if doc is None:
+        nouveau = {"mi": p.mi, "steps": p.steps, "duree_s": duree}
+    else:
+        total = doc["duree_s"] + duree
+        nouveau = {
+            "mi": (doc["mi"] * doc["duree_s"] + p.mi * duree) / total,
+            "steps": doc["steps"] + p.steps,
+            "duree_s": total,
+        }
+    mesures_activite.update_one(cle, {"$set": nouveau}, upsert=True)
+
+
 # ---------------------------------------------------------------------------
 # Collier silencieux
 # ---------------------------------------------------------------------------
@@ -302,9 +351,14 @@ def on_message(client, userdata, msg):
     if position.timestamp.tzinfo is None:
         position.timestamp = position.timestamp.replace(tzinfo=timezone.utc)
 
-    positions.insert_one(position.model_dump())
+    positions.insert_one(doc_position(position))
     print(f"Enregistré : {position.animal_id} ({position.lat}, {position.lon})")
-    diffuseur.publier({"type": "position", "data": position.model_dump()})
+    diffuseur.publier({"type": "position", "data": doc_position(position)})
+
+    try:
+        enregistrer_mesure(position)           # AJOUT SIM
+    except Exception as erreur:
+        print(f"Erreur enregistrer_mesure : {erreur}")
 
     try:
         gerer_alerte(position.animal_id, "collier_silencieux", False, "", position)
@@ -312,7 +366,7 @@ def on_message(client, userdata, msg):
         print(f"Erreur collier_silencieux : {erreur}")
 
     for verification in (verifier_troupeau, verifier_pature,
-                         verifier_alertes_individuelles):
+                         verifier_alertes_individuelles, verifier_batterie):
         try:
             verification(position)
         except Exception as erreur:
@@ -334,6 +388,9 @@ async def lifespan(app: FastAPI):
     diffuseur.boucle = asyncio.get_running_loop()
     await asyncio.to_thread(
         positions.create_index, [("animal_id", 1), ("timestamp", -1)]
+    )
+    await asyncio.to_thread(
+        mesures_activite.create_index, [("animal_id", 1), ("timestamp", -1)]   # AJOUT SIM
     )
     await asyncio.to_thread(
         etat_animaux.create_index, "animal_id", unique=True
@@ -359,7 +416,7 @@ app.include_router(creer_router(mesures_activite, appliquer_alerte_ia))    # AJO
 
 
 # ---------------------------------------------------------------------------
-# Caractéristiques des animaux (AJOUT INFO)
+# Caractéristiques des animaux
 # ---------------------------------------------------------------------------
 @app.get("/animaux")
 def lire_animaux():
@@ -414,7 +471,8 @@ def creer_pature(donnees: dict):
         d = positions.find_one({"animal_id": animal_id}, sort=[("timestamp", -1)])
         if d:
             try:
-                verifier_pature(Position(**{k: d[k] for k in Position.model_fields}))
+                # AJOUT SIM : "if k in d" évite une erreur sur les anciens documents
+                verifier_pature(Position(**{k: d[k] for k in Position.model_fields if k in d}))
             except Exception as e:
                 print(f"Vérification initiale ignorée : {e}")
     diffuseur.publier({"type": "pature", "data": {
