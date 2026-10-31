@@ -3,3 +3,4 @@ venv/
 __pycache__/
 IA/vache.csv
 prompt
+Isolation.py

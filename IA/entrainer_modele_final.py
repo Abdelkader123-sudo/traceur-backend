@@ -89,15 +89,25 @@ def appliquer_references(d, refs):
     return d.dropna(subset=FEATURES).reset_index(drop=True)
 
 
-def preparer(df):
-    """Données brutes -> tableau de caractéristiques relatives (références propres à chaque animal)."""
-    d = caracteristiques_base(agreger_horaire(df))
+def preparer_depuis_horaire(horaire):
+    """Prend un DataFrame déjà agrégé par heure et retourne les features relatives.
+
+    La routine calculée pour le modèle est le profil horaire (prof_1h), complété par les
+    profils sur 6 h et les médianes sur 24 h. Le code de sortie reste identique à
+    l'ancienne version ; on sépare simplement l'agrégation pour éviter de la refaire.
+    """
+    d = caracteristiques_base(horaire)
     valides = d.groupby("cow_name")["pas_24h"].count()
     trop_courts = sorted(valides[valides < MIN_HEURES_REF].index)
     if trop_courts:
         print(f"Attention : pas assez de mesures pour {trop_courts} (< {MIN_HEURES_REF} h valides), ignorés")
         d = d[~d["cow_name"].isin(trop_courts)]
     return appliquer_references(d, construire_references(d))
+
+
+def preparer(df):
+    """Données brutes -> tableau de caractéristiques relatives (références propres à chaque animal)."""
+    return preparer_depuis_horaire(agreger_horaire(df))
 
 
 def entrainer(df):
@@ -117,9 +127,21 @@ def scorer(bundle, df):
     return X[["cow_name", "timestamp", "score", "alerte"]]
 
 
-def bilan_quotidien(res):
-    """Pour chaque animal : heures en alerte et score maximal sur les 24 dernières heures."""
-    dernier = res[res["timestamp"] > res["timestamp"].max() - pd.Timedelta(hours=24)]
+def bilan_quotidien(res, reference=None):
+    """Pour chaque animal : heures en alerte et score maximal sur les 24 dernières heures.
+
+    Par défaut, on garde le comportement historique (fin = max(timestamp) du DataFrame). Si
+    `reference` est fourni, la fenêtre est calculée comme ]reference - 24h, reference].
+    """
+    if res.empty:
+        return pd.DataFrame(columns=["heures_alerte", "score_max"])
+    ref = pd.Timestamp(reference) if reference is not None else res["timestamp"].max()
+    ts_tz = getattr(res["timestamp"].dt, "tz", None)
+    if ts_tz is not None and getattr(ref, "tzinfo", None) is None:
+        ref = ref.tz_localize(ts_tz)
+    elif ts_tz is None and getattr(ref, "tzinfo", None) is not None:
+        ref = ref.tz_localize(None)
+    dernier = res[(res["timestamp"] > ref - pd.Timedelta(hours=24)) & (res["timestamp"] <= ref)]
     return (dernier.groupby("cow_name").agg(heures_alerte=("alerte", "sum"), score_max=("score", "max"))
             .round(3).sort_values(["heures_alerte", "score_max"], ascending=False))
 
