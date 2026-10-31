@@ -13,7 +13,7 @@ from pymongo import MongoClient
 
 from DBSCAN import analyser_troupeaux, deplacement_inhabituel, est_immobile
 from geofence import analyser_point, valider_sommets
-from IA.ia_routes import creer_router          # AJOUT IA
+from IA.ia_routes import creer_router, calculer_bilan, SEUIL_HEURES_ALERTE   # AJOUT IA
 from params import BORNES, DEFAUTS, valider_parametres
 
 MQTT_HOST = os.getenv("MQTT_HOST", "ycf81881.ala.eu-central-1.emqxsl.com")
@@ -27,6 +27,12 @@ MONGO_URI = os.environ["MONGO_URI"]
 
 INTERVALLE_VERIF_COLLIERS_S = 60   # vérification des colliers silencieux
 
+# AJOUT IA AUTO : bilan Isolation Forest lancé automatiquement
+IA_AUTO = os.getenv("IA_AUTO", "true").lower() != "false"          # IA_AUTO=false pour le désactiver
+INTERVALLE_BILAN_IA_S = int(os.getenv("IA_INTERVALLE_S", "3600"))  # une fois par heure
+DELAI_PREMIER_BILAN_S = 60                                         # laisse le serveur démarrer
+DUREE_CONSERVATION_MESURES_S = 30 * 24 * 3600                      # TTL de mesures_activite : 30 jours
+
 mongo_client = MongoClient(MONGO_URI, tz_aware=True)
 base = mongo_client["traceur_gps"]
 positions = base["positions"]
@@ -35,7 +41,7 @@ etat_animaux = base["etat_animaux"]
 animaux = base["animaux"]
 pasture = base["pastures"]
 parametres_col = base["parametres"]
-mesures_activite = base["mesures_activite"]    # AJOUT IA : un document par animal et par minute (mi, steps)
+mesures_activite = base["mesures_activite"]    # AJOUT IA : un document par message (mi, steps, duree_s)
 
 _cache_params = {"v": None}
 _cache_zone = {"zone": None, "charge": False}
@@ -143,6 +149,46 @@ def appliquer_alerte_ia(animal_id, condition, message):
         return
     doc["timestamp"] = datetime.now(timezone.utc)
     gerer_alerte(animal_id, "comportement_inhabituel", condition, message, Position(**doc))
+
+
+def executer_bilan_ia():
+    """AJOUT IA AUTO : calcule le bilan des 24 dernières heures pour tous les animaux
+    et ouvre / résout les alertes « comportement_inhabituel » (même logique que
+    GET /ia/bilan?enregistrer=true)."""
+    animaux_ia, ignores = calculer_bilan(mesures_activite)
+    for x in animaux_ia:
+        try:
+            appliquer_alerte_ia(
+                x["animal_id"], x["statut"] == "a_surveiller",
+                f"Comportement inhabituel : {x['heures_alerte']} h en alerte sur les "
+                f"dernières 24 h (à vérifier)")
+        except Exception as erreur:
+            print(f"Erreur alerte IA {x['animal_id']} : {erreur}")
+    nb = sum(1 for x in animaux_ia if x["statut"] == "a_surveiller")
+    print(f"Bilan IA : {len(animaux_ia)} animaux analysés, {nb} à surveiller "
+          f"(seuil {SEUIL_HEURES_ALERTE} h), {len(ignores)} ignorés")
+
+
+async def surveillance_ia():
+    """AJOUT IA AUTO : lance le bilan à intervalle régulier."""
+    await asyncio.sleep(DELAI_PREMIER_BILAN_S)
+    while True:
+        try:
+            await asyncio.to_thread(executer_bilan_ia)
+        except FileNotFoundError:
+            print("Bilan IA ignoré : modèle introuvable")
+        except Exception as erreur:
+            print(f"Erreur bilan IA : {erreur}")
+        await asyncio.sleep(INTERVALLE_BILAN_IA_S)
+
+
+def creer_index_ttl():
+    """AJOUT IA AUTO : supprime automatiquement les mesures d'activité de plus de 30 jours."""
+    try:
+        mesures_activite.create_index(
+            "timestamp", expireAfterSeconds=DUREE_CONSERVATION_MESURES_S)
+    except Exception as erreur:
+        print(f"Index TTL mesures_activite non créé : {erreur}")
 
 
 # ---------------------------------------------------------------------------
@@ -356,11 +402,15 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(
         mesures_activite.create_index, [("animal_id", 1), ("timestamp", -1)]
     )      # AJOUT IA
+    await asyncio.to_thread(creer_index_ttl)            # AJOUT IA AUTO
     mqtt_client.connect(MQTT_HOST, MQTT_PORT)
     mqtt_client.loop_start()
     tache = asyncio.create_task(surveillance_colliers())
+    tache_ia = asyncio.create_task(surveillance_ia()) if IA_AUTO else None   # AJOUT IA AUTO
     yield
     tache.cancel()
+    if tache_ia:
+        tache_ia.cancel()
     mqtt_client.loop_stop()
     mqtt_client.disconnect()
     mongo_client.close()
@@ -373,7 +423,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE", "PUT"],
     allow_headers=["*"],
 )
-app.include_router(creer_router(mesures_activite, appliquer_alerte_ia))    # AJOUT IA : GET /ia/bilan
+app.include_router(creer_router(mesures_activite, appliquer_alerte_ia))    # AJOUT IA : /ia/bilan, /ia/historique
 
 
 @app.post("/pastures")
