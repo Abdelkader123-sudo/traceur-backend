@@ -7,17 +7,18 @@ Collection de mesures d'activité, un document par message :
     {"animal_id": "cow01", "timestamp": datetime (UTC), "mi": 3, "steps": 1, "duree_s": 60}
 
 Branchement dans main.py :
-    app.include_router(creer_router(mesures_activite, appliquer_alerte_ia))
+    app.include_router(creer_router(mesures_activite, appliquer_alerte_ia, lambda: P()["reference_jours"]))
 
 Routes :
     GET /ia/bilan                          -> bilan des 24 dernières heures (lecture seule)
     GET /ia/bilan?enregistrer=true         -> ouvre / résout aussi les alertes « comportement_inhabituel »
-    GET /ia/bilan?heures=240               -> fenêtre d'historique plus longue (référence plus stable)
+    GET /ia/bilan?heures=240               -> fenêtre d'historique forcée (sinon : durée de référence du réglage)
     GET /ia/historique/{animal_id}         -> courbe heure par heure : pas, routine attendue, score, anomalie
     GET /ia/historique/{animal_id}?heures=336
     GET /ia/historique/{animal_id}?debut=2026-10-24&fin=2026-10-28
                                    -> plage de dates (heure locale ; fin EXCLUE, 30 jours max)
-    Dans tous les cas la référence = les 7 derniers jours (même calcul que l'alerte automatique).
+    Dans tous les cas la référence = les N derniers jours du réglage « reference_jours » (7 par défaut),
+    même calcul que l'alerte automatique.
 """
 import os
 from datetime import datetime, timedelta, timezone
@@ -39,10 +40,23 @@ DOSSIER = os.path.dirname(os.path.abspath(__file__))
 CHEMIN_MODELE = os.getenv("IA_MODELE", os.path.join(DOSSIER, "modele_isolation_forest_final.joblib"))
 FUSEAU = os.getenv("IA_FUSEAU", "Africa/Tunis")     # fuseau LOCAL de l'élevage (le rythme jour/nuit en dépend)
 SEUIL_HEURES_ALERTE = 3      # nb d'heures en alerte sur 24 h pour classer « à surveiller » (valeur de départ, non validée)
-HEURES_DEFAUT = 168          # 7 jours d'historique : référence personnelle plus stable
+HEURES_DEFAUT = 168          # 7 jours : durée de référence par défaut (sans réglage enregistré)
 HEURES_MAX = 720             # 30 jours : limite pour éviter des calculs trop lourds
 HEURES_MIN = MIN_HEURES_REF + 24   # 96 h : 72 h valides + ~18 h perdues par la moyenne glissante sur 24 h
 _bundle = None
+_jours_reference = None      # callable sans argument -> nombre de jours (posé par creer_router)
+
+
+def heures_reference_courantes():
+    """Durée de la référence en heures : réglage utilisateur lu à l'instant, sinon HEURES_DEFAUT."""
+    if _jours_reference is not None:
+        try:
+            heures = int(_jours_reference()) * 24
+            if HEURES_MIN <= heures <= HEURES_MAX:
+                return heures
+        except Exception:
+            pass
+    return HEURES_DEFAUT
 
 
 def charger_modele():
@@ -81,8 +95,12 @@ def lire_mesures(mesures, heures=None, animal_id=None, debut_local=None, fin_loc
     return df[[c for c in ["timestamp", "cow_name", "mi", "steps", "duree_s"] if c in df.columns]]
 
 
-def calculer_bilan(mesures, heures=HEURES_DEFAUT):
-    """Retourne (animaux, ignores) ; lève FileNotFoundError si le modèle est absent."""
+def calculer_bilan(mesures, heures=None):
+    """Retourne (animaux, ignores) ; lève FileNotFoundError si le modèle est absent.
+
+    heures=None : durée de référence courante (réglage « reference_jours », 7 jours par défaut)."""
+    if heures is None:
+        heures = heures_reference_courantes()
     bundle = charger_modele()
     df = lire_mesures(mesures, heures)
     if df.empty:
@@ -107,11 +125,13 @@ def _nb(x, n=2):
     return None if x is None or pd.isna(x) else round(float(x), n)
 
 
-def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fin=None):
+def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fin=None,
+                        reference_heures=None):
     """Courbe heure par heure d'UN animal, jugée par rapport à une référence FIXE.
 
-    Référence : les HEURES_DEFAUT (7 jours) qui précèdent MAINTENANT. C'est exactement le calcul
-    de l'alerte automatique (calculer_bilan), donc la page et l'alerte donnent le même verdict.
+    Référence : les `reference_heures` qui précèdent MAINTENANT (None = durée de référence courante,
+    7 jours par défaut). C'est exactement le calcul de l'alerte automatique (calculer_bilan), donc la
+    page et l'alerte donnent le même verdict.
 
     La période demandée (`heures` dernières heures, ou plage [debut, fin) en pd.Timestamp locaux,
     même d'un seul jour) ne change PAS la référence : elle ne sert qu'à choisir les heures
@@ -121,16 +141,18 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
     pas_attendus ne montre que le profil horaire (prof_1h) de la routine ; le modèle utilise aussi
     les profils sur 6 h et les médianes sur 24 h.
     Retourne None si l'animal n'a aucune mesure sur la période affichée."""
+    if reference_heures is None:
+        reference_heures = heures_reference_courantes()
     bundle = charger_modele()
     maintenant = pd.Timestamp.now(tz=FUSEAU).tz_localize(None)
-    ref_debut = maintenant - pd.Timedelta(hours=HEURES_DEFAUT)
+    ref_debut = maintenant - pd.Timedelta(hours=reference_heures)
     if debut is not None:
         aff_debut, aff_fin = debut, fin
     else:
         aff_debut, aff_fin = maintenant - pd.Timedelta(hours=heures), maintenant
 
-    # 1) données de la référence (7 derniers jours)
-    df_ref = lire_mesures(mesures, HEURES_DEFAUT, animal_id)
+    # 1) données de la référence (N derniers jours)
+    df_ref = lire_mesures(mesures, reference_heures, animal_id)
     # 2) données à afficher : la référence + ce qui est plus ancien si la période le demande
     if aff_debut < ref_debut:
         df_old = lire_mesures(mesures, animal_id=animal_id, debut_local=aff_debut,
@@ -148,7 +170,8 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
         return None
 
     reference = {"debut": ref_debut.isoformat(), "fin": maintenant.isoformat(),
-                 "heures": HEURES_DEFAUT}
+                 "heures": reference_heures}
+    reference_jours = reference_heures // 24
 
     X = pd.DataFrame()
     if nb_valides >= MIN_HEURES_REF and not df_ref.empty:
@@ -158,9 +181,10 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
                    "pas_attendus": None, "score": None, "alerte": None}
                   for t, s, m in brut.itertuples(index=False)]
         return {"animal_id": animal_id, "statut": "historique_insuffisant",
-                "raison": f"{nb_valides} h valides sur les {HEURES_DEFAUT // 24} derniers jours "
+                "raison": f"{nb_valides} h valides sur les {reference_jours} derniers jours "
                           f"(minimum {MIN_HEURES_REF} h) : routine non calculable",
-                "heures_valides": nb_valides, "reference": reference, "points": points}
+                "heures_valides": nb_valides, "reference": reference,
+                "reference_jours": reference_jours, "points": points}
 
     X = X.copy()
     X["score"] = -bundle["modele"].decision_function(X[bundle["features"]])
@@ -191,19 +215,29 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
         "score_max_24h": _nb(dern["score"].max(), 3),
         "seuil_score": 0.0,                  # score > 0 = heure anormale
         "seuil_heures": SEUIL_HEURES_ALERTE,
-        "heures_valides": nb_valides,        # heures valides de la référence (7 jours)
+        "heures_valides": nb_valides,        # heures valides de la référence
         "reference": reference,
+        "reference_jours": reference_jours,
         "fuseau": FUSEAU,
         "points": points}
 
 
-def creer_router(mesures, appliquer_alerte=None):
-    """appliquer_alerte(animal_id, condition, message) : branche le bilan sur le système d'alertes."""
+def creer_router(mesures, appliquer_alerte=None, jours_reference=None):
+    """appliquer_alerte(animal_id, condition, message) : branche le bilan sur le système d'alertes.
+
+    jours_reference() : callable sans argument renvoyant la durée de référence en jours
+    (lue à chaque appel) ; None = 7 jours."""
+    global _jours_reference
+    _jours_reference = jours_reference
     router = APIRouter(prefix="/ia", tags=["ia"])
 
     @router.get("/bilan")
-    def bilan(heures: int = HEURES_DEFAUT, enregistrer: bool = False):
-        """Animaux dont le comportement est inhabituel sur les 24 dernières heures."""
+    def bilan(heures: Optional[int] = None, enregistrer: bool = False):
+        """Animaux dont le comportement est inhabituel sur les 24 dernières heures.
+
+        `heures` absent = durée de référence courante (réglage « reference_jours »)."""
+        if heures is None:
+            heures = heures_reference_courantes()
         if heures < HEURES_MIN:
             raise HTTPException(400, f"Il faut au moins {HEURES_MIN} h d'historique (reçu : {heures}).")
         if enregistrer and appliquer_alerte is None:
@@ -230,9 +264,9 @@ def creer_router(mesures, appliquer_alerte=None):
                    debut: Optional[str] = None, fin: Optional[str] = None):
         """Historique d'activité heure par heure d'un animal, avec les heures anormales.
 
-        Soit `heures` (dernières heures), soit `debut` et `fin` (dates locales, fin EXCLUE).
-        La référence est toujours celle des 7 derniers jours : la période choisie (même un seul
-        jour) ne fait que sélectionner les heures affichées."""
+        Soit `heures` (dernières heures affichées), soit `debut` et `fin` (dates locales, fin EXCLUE).
+        La référence est toujours celle du réglage « reference_jours » (7 jours par défaut) : la
+        période choisie (même un seul jour) ne fait que sélectionner les heures affichées."""
         d = f = None
         if (debut is None) != (fin is None):
             raise HTTPException(400, "debut et fin doivent être fournis ensemble.")

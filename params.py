@@ -12,6 +12,7 @@ DEFAUTS = {
     "duree_immobilite_s": 1800,    # repos continu avant alerte (s)
     "delai_collier_s": 600,        # silence du collier avant alerte (s)
     "marge_pature_m": 10,          # tolérance hors zone dessinée (m)
+    "reference_jours": 7,          # durée de la référence IA (jours)
 }
 
 # clé: (minimum, maximum, entier ?)
@@ -27,7 +28,14 @@ BORNES = {
     "duree_immobilite_s": (60, 86400, True),
     "delai_collier_s": (60, 86400, True),
     "marge_pature_m": (0, 500, False),
+    # minimum 4 j : avec 72 h valides requises, 3 j donneraient toujours « historique insuffisant » ;
+    # maximum 14 j : le serveur supprime les mesures de plus de 30 jours
+    "reference_jours": (4, 14, True),
 }
+
+# Paramètres entiers pour lesquels une valeur décimale (4.5) est refusée au lieu d'être tronquée.
+# (Les autres entiers gardent leur comportement actuel.)
+ENTIERS_STRICTS = {"reference_jours"}
 
 
 def valider_parametres(donnees: dict) -> dict:
@@ -39,6 +47,11 @@ def valider_parametres(donnees: dict) -> dict:
         if cle not in BORNES:
             raise ValueError(f"Paramètre inconnu : {cle}")
         mini, maxi, entier = BORNES[cle]
+        if cle in ENTIERS_STRICTS:
+            if isinstance(valeur, bool):
+                raise ValueError(f"{cle} : nombre entier attendu.")
+            if isinstance(valeur, float) and not valeur.is_integer():
+                raise ValueError(f"{cle} : nombre entier attendu.")
         try:
             v = int(valeur) if entier else float(valeur)
         except (TypeError, ValueError):

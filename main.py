@@ -163,8 +163,8 @@ def appliquer_alerte_ia(animal_id, condition, message):
 def executer_bilan_ia():
     """AJOUT IA AUTO : calcule le bilan des 24 dernières heures pour tous les animaux
     et ouvre / résout les alertes « comportement_inhabituel » (même logique que
-    GET /ia/bilan?enregistrer=true)."""
-    animaux_ia, ignores = calculer_bilan(mesures_activite)
+    GET /ia/bilan?enregistrer=true). La référence dure reference_jours jours (réglage)."""
+    animaux_ia, ignores = calculer_bilan(mesures_activite, P()["reference_jours"] * 24)
     for x in animaux_ia:
         try:
             appliquer_alerte_ia(
@@ -176,6 +176,20 @@ def executer_bilan_ia():
     nb = sum(1 for x in animaux_ia if x["statut"] == "a_surveiller")
     print(f"Bilan IA : {len(animaux_ia)} animaux analysés, {nb} à surveiller "
           f"(seuil {SEUIL_HEURES_ALERTE} h), {len(ignores)} ignorés")
+
+
+def recalculer_alertes_ia():
+    """Recalcul des alertes IA en tâche de fond après un changement de reference_jours.
+    Ne lève jamais d'exception (ne doit pas faire échouer la réponse HTTP).
+    Ignoré si le bilan automatique est désactivé (IA_AUTO=false)."""
+    if not IA_AUTO:
+        return
+    try:
+        executer_bilan_ia()
+    except FileNotFoundError:
+        print("Recalcul IA ignoré : modèle introuvable")
+    except Exception as erreur:
+        print(f"Erreur recalcul IA : {erreur}")
 
 
 async def surveillance_ia():
@@ -455,7 +469,9 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE", "PUT"],
     allow_headers=["*"],
 )
-app.include_router(creer_router(mesures_activite, appliquer_alerte_ia))    # AJOUT IA : /ia/bilan, /ia/historique
+# AJOUT IA : /ia/bilan, /ia/historique ; la durée de référence est lue à chaque appel
+app.include_router(creer_router(mesures_activite, appliquer_alerte_ia,
+                                lambda: P()["reference_jours"]))
 
 
 @app.post("/pastures")
@@ -631,18 +647,24 @@ def modifier_parametres(donnees: dict, taches: BackgroundTasks):
         propres = valider_parametres(donnees)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    ancienne_reference = P()["reference_jours"]
     nouveaux = {**P(), **propres}
     parametres_col.update_one({"_id": "global"}, {"$set": nouveaux}, upsert=True)
     _cache_params["v"] = nouveaux
     taches.add_task(reevaluer_tous)            # MODIFIÉ : après la réponse
+    if nouveaux["reference_jours"] != ancienne_reference:
+        taches.add_task(recalculer_alertes_ia)  # AJOUT : alertes IA recalculées tout de suite
     return {"statut": "ok", "valeurs": nouveaux}
 
 
 @app.post("/parametres/reinitialiser")
 def reinitialiser_parametres(taches: BackgroundTasks):
+    ancienne_reference = P()["reference_jours"]
     parametres_col.delete_one({"_id": "global"})
     _cache_params["v"] = dict(DEFAUTS)
     taches.add_task(reevaluer_tous)            # MODIFIÉ : après la réponse
+    if DEFAUTS["reference_jours"] != ancienne_reference:
+        taches.add_task(recalculer_alertes_ia)  # AJOUT : alertes IA recalculées tout de suite
     return {"statut": "ok", "valeurs": DEFAUTS}
 
 
