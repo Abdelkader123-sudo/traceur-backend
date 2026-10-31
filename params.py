@@ -28,9 +28,11 @@ BORNES = {
     "duree_immobilite_s": (60, 86400, True),
     "delai_collier_s": (60, 86400, True),
     "marge_pature_m": (0, 500, False),
-    # minimum 4 j : avec 72 h valides requises, 3 j donneraient toujours « historique insuffisant » ;
+    # minimum 5 j : avec 72 h valides requises, 3 j donneraient toujours « historique insuffisant » ;
+    # à 4 j (96 h) il ne reste aucune marge pour les heures sans mesure, car le modèle perd ~18 h
+    # au démarrage de ses moyennes glissantes.
     # maximum 14 j : le serveur supprime les mesures de plus de 30 jours
-    "reference_jours": (4, 14, True),
+    "reference_jours": (5, 14, True),
 }
 
 # Paramètres entiers pour lesquels une valeur décimale (4.5) est refusée au lieu d'être tronquée.

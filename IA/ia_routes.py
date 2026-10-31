@@ -180,9 +180,18 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
         points = [{"heure": t.isoformat(), "valide": bool(pd.notna(s)), "pas": _nb(s, 1), "mi": _nb(m, 1),
                    "pas_attendus": None, "score": None, "alerte": None}
                   for t, s, m in brut.itertuples(index=False)]
+        if nb_valides < MIN_HEURES_REF:
+            raison = (f"{nb_valides} h valides sur les {reference_jours} derniers jours "
+                      f"(minimum {MIN_HEURES_REF} h) : routine non calculable")
+        else:
+            # Le décompte brut passe le minimum, mais les premières heures de la référence sont
+            # perdues par les moyennes glissantes : il en reste trop peu pour calculer la routine.
+            raison = (f"{nb_valides} h valides sur les {reference_jours} derniers jours : "
+                      f"insuffisant. Les premières heures de la référence sont perdues par les "
+                      f"moyennes glissantes ; il faut environ {HEURES_MIN} h valides. "
+                      f"Augmentez la durée de la référence.")
         return {"animal_id": animal_id, "statut": "historique_insuffisant",
-                "raison": f"{nb_valides} h valides sur les {reference_jours} derniers jours "
-                          f"(minimum {MIN_HEURES_REF} h) : routine non calculable",
+                "raison": raison,
                 "heures_valides": nb_valides, "reference": reference,
                 "reference_jours": reference_jours, "points": points}
 
