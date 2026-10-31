@@ -3,12 +3,12 @@ import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 import paho.mqtt.client as mqtt
 from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from pymongo import MongoClient
 
 from DBSCAN import analyser_troupeaux, deplacement_inhabituel, est_immobile
@@ -38,7 +38,7 @@ base = mongo_client["traceur_gps"]
 positions = base["positions"]
 alerts = base["alerts"]
 etat_animaux = base["etat_animaux"]
-animaux = base["animaux"]
+animaux = base["animaux"]                      # fiches des animaux (type, sexe, âge, poids)
 pasture = base["pastures"]
 parametres_col = base["parametres"]
 mesures_activite = base["mesures_activite"]    # AJOUT IA : un document par message (mi, steps, duree_s)
@@ -105,6 +105,14 @@ class Position(BaseModel):
     vitesse: float
     activite: str
     timestamp: datetime
+
+
+class InfoAnimal(BaseModel):
+    """Fiche d'un animal, telle qu'envoyée par l'application."""
+    type: Optional[str] = Field(None, max_length=80)
+    sexe: Optional[Literal["femelle", "male"]] = None
+    age_ans: Optional[float] = Field(None, ge=0, le=40)
+    poids_kg: Optional[float] = Field(None, gt=0, le=1500)
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +408,9 @@ async def lifespan(app: FastAPI):
         etat_animaux.create_index, "animal_id", unique=True
     )
     await asyncio.to_thread(
+        animaux.create_index, "animal_id", unique=True
+    )      # AJOUT FICHES ANIMAUX
+    await asyncio.to_thread(
         mesures_activite.create_index, [("animal_id", 1), ("timestamp", -1)]
     )      # AJOUT IA
     await asyncio.to_thread(creer_index_ttl)            # AJOUT IA AUTO
@@ -501,6 +512,27 @@ def lire_alertes(animal_id: Optional[str] = None, actives: bool = False, limite:
     if actives:
         filtre["resolue"] = False
     return list(alerts.find(filtre, {"_id": 0}).sort("timestamp", -1).limit(limite))
+
+
+# ---------------------------------------------------------------------------
+# Fiches des animaux (type, sexe, âge, poids)
+# ---------------------------------------------------------------------------
+@app.get("/animaux")
+def lire_animaux():
+    """Liste des fiches enregistrées (utilisée par la page « Mon troupeau »)."""
+    return list(animaux.find({}, {"_id": 0, "modifie_le": 0}))
+
+
+@app.put("/animaux/{animal_id}")
+def enregistrer_animal(animal_id: str, info: InfoAnimal):
+    """Crée ou met à jour la fiche d'un animal."""
+    fiche = info.model_dump()
+    animaux.update_one(
+        {"animal_id": animal_id},
+        {"$set": {**fiche, "modifie_le": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+    return {"animal_id": animal_id, **fiche}
 
 
 @app.get("/troupeau")
