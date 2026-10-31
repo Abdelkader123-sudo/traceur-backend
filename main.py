@@ -10,6 +10,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocke
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
 from pymongo import MongoClient
+from pymongo.errors import OperationFailure
 
 from DBSCAN import analyser_troupeaux, deplacement_inhabituel, est_immobile
 from geofence import analyser_point, valider_sommets
@@ -191,12 +192,34 @@ async def surveillance_ia():
 
 
 def creer_index_ttl():
-    """AJOUT IA AUTO : supprime automatiquement les mesures d'activité de plus de 30 jours."""
+    """AJOUT IA AUTO : supprime automatiquement les mesures d'activité de plus de 30 jours.
+
+    Si un index simple « timestamp_1 » existe déjà sans TTL (code 85), on le remplace."""
     try:
         mesures_activite.create_index(
             "timestamp", expireAfterSeconds=DUREE_CONSERVATION_MESURES_S)
+    except OperationFailure as erreur:
+        if erreur.code != 85:
+            print(f"Index TTL mesures_activite non créé : {erreur}")
+            return
+        try:
+            mesures_activite.drop_index("timestamp_1")
+            mesures_activite.create_index(
+                "timestamp", expireAfterSeconds=DUREE_CONSERVATION_MESURES_S)
+            print("Index TTL mesures_activite converti (30 jours)")
+        except Exception as erreur2:
+            print(f"Index TTL mesures_activite non converti : {erreur2}")
     except Exception as erreur:
         print(f"Index TTL mesures_activite non créé : {erreur}")
+
+
+def creer_index_animaux():
+    """Un seul document par animal. Un échec (ex. doublons déjà présents dans la
+    collection) ne doit pas empêcher le serveur de démarrer."""
+    try:
+        animaux.create_index("animal_id", unique=True)
+    except Exception as erreur:
+        print(f"Index animaux non créé : {erreur}")
 
 
 # ---------------------------------------------------------------------------
@@ -407,9 +430,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(
         etat_animaux.create_index, "animal_id", unique=True
     )
-    await asyncio.to_thread(
-        animaux.create_index, "animal_id", unique=True
-    )      # AJOUT FICHES ANIMAUX
+    await asyncio.to_thread(creer_index_animaux)        # AJOUT FICHES ANIMAUX (sans bloquer le démarrage)
     await asyncio.to_thread(
         mesures_activite.create_index, [("animal_id", 1), ("timestamp", -1)]
     )      # AJOUT IA
