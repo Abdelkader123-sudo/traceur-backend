@@ -17,6 +17,7 @@ Routes :
     GET /ia/historique/{animal_id}?heures=336
     GET /ia/historique/{animal_id}?debut=2026-10-24&fin=2026-10-28
                                    -> plage de dates (heure locale ; fin EXCLUE, 30 jours max)
+    Dans tous les cas la référence = les 7 derniers jours (même calcul que l'alerte automatique).
 """
 import os
 from datetime import datetime, timedelta, timezone
@@ -40,7 +41,6 @@ FUSEAU = os.getenv("IA_FUSEAU", "Africa/Tunis")     # fuseau LOCAL de l'élevage
 SEUIL_HEURES_ALERTE = 3      # nb d'heures en alerte sur 24 h pour classer « à surveiller » (valeur de départ, non validée)
 HEURES_DEFAUT = 168          # 7 jours d'historique : référence personnelle plus stable
 HEURES_MAX = 720             # 30 jours : limite pour éviter des calculs trop lourds
-HEURES_CONTEXTE = 168        # historique chargé AVANT la date de début choisie, pour calculer la routine
 HEURES_MIN = MIN_HEURES_REF + 24   # 96 h : 72 h valides + ~18 h perdues par la moyenne glissante sur 24 h
 _bundle = None
 
@@ -81,30 +81,14 @@ def lire_mesures(mesures, heures=None, animal_id=None, debut_local=None, fin_loc
     return df[[c for c in ["timestamp", "cow_name", "mi", "steps", "duree_s"] if c in df.columns]]
 
 
-def _reference_locale(reference=None):
-    """Heure de référence en heure locale naïve (sans tz), arrondie à l'heure."""
-    if reference is None:
-        return pd.Timestamp.now(tz=FUSEAU).tz_localize(None).floor("h")
-    ref = pd.Timestamp(reference)
-    if getattr(ref, "tzinfo", None) is not None:
-        ref = ref.tz_convert(FUSEAU).tz_localize(None)
-    return ref.floor("h")
-
-
-def calculer_bilan(mesures, heures=HEURES_DEFAUT, reference=None):
-    """Retourne (animaux, ignores) ; lève FileNotFoundError si le modèle est absent.
-
-    La fenêtre de calcul est [reference - heures, reference] en heure locale, avec reference
-    désormais explicite pour éviter de rabaisser la fenêtre sur la dernière mesure reçue.
-    """
+def calculer_bilan(mesures, heures=HEURES_DEFAUT):
+    """Retourne (animaux, ignores) ; lève FileNotFoundError si le modèle est absent."""
     bundle = charger_modele()
-    ref = _reference_locale(reference)
-    df = lire_mesures(mesures, animal_id=None, fin_local=ref,
-                      debut_local=ref - pd.Timedelta(hours=heures))
+    df = lire_mesures(mesures, heures)
     if df.empty:
         return [], []
     res = scorer(bundle, df)
-    resume = bilan_quotidien(res, reference=ref) if not res.empty else pd.DataFrame(columns=["heures_alerte", "score_max"])
+    resume = bilan_quotidien(res) if not res.empty else pd.DataFrame(columns=["heures_alerte", "score_max"])
 
     animaux = [{"animal_id": str(a), "heures_alerte": int(r["heures_alerte"]),
                 "score_max": float(r["score_max"]),
@@ -118,92 +102,71 @@ def calculer_bilan(mesures, heures=HEURES_DEFAUT, reference=None):
     return animaux, ignores
 
 
-def _statut_animal(mesures, animal_id, reference=None):
-    """Statut pour un animal sur la fenêtre standard 168 h finissant à `reference`. """
-    ref = _reference_locale(reference)
-    df = lire_mesures(mesures, animal_id=animal_id, fin_local=ref,
-                      debut_local=ref - pd.Timedelta(hours=HEURES_DEFAUT))
-    if df.empty:
-        return None
-    res = scorer(charger_modele(), df)
-    if res.empty:
-        return None
-    resume = bilan_quotidien(res, reference=ref)
-    animal = resume.loc[str(animal_id)] if str(animal_id) in resume.index else None
-    if animal is None:
-        return {"statut": "historique_insuffisant",
-                "heures_alerte_24h": 0,
-                "score_max_24h": None,
-                "raison": f"historique insuffisant (moins de {MIN_HEURES_REF} h valides) ou aucune mesure exploitable sur les dernières 24 h"}
-    h_alerte = int(animal["heures_alerte"])
-    return {"statut": "a_surveiller" if h_alerte >= SEUIL_HEURES_ALERTE else "normal",
-            "heures_alerte_24h": h_alerte,
-            "score_max_24h": _nb(float(animal["score_max"]), 3),
-            "seuil_score": 0.0,
-            "seuil_heures": SEUIL_HEURES_ALERTE,
-            "fuseau": FUSEAU}
-
-
 def _nb(x, n=2):
     """Nombre arrondi, ou None si absent (JSON n'accepte pas NaN)."""
     return None if x is None or pd.isna(x) else round(float(x), n)
 
 
-def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fin=None, reference=None):
-    """Courbe heure par heure d'UN animal. Retourne None s'il n'a aucune mesure.
+def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fin=None):
+    """Courbe heure par heure d'UN animal, jugée par rapport à une référence FIXE.
 
-    Deux modes : les `heures` dernières heures, ou la plage [debut, fin) (pd.Timestamp locaux).
-    En mode plage, on charge HEURES_CONTEXTE heures AVANT `debut` pour calculer la routine,
-    puis on ne renvoie que les heures de la plage demandée.
+    Référence : les HEURES_DEFAUT (7 jours) qui précèdent MAINTENANT. C'est exactement le calcul
+    de l'alerte automatique (calculer_bilan), donc la page et l'alerte donnent le même verdict.
 
-    La « routine » affichée est seulement le profil horaire (`prof_1h`) ; le modèle lui-même
-    utilise aussi le profil sur 6 h et les médianes sur 24 h comme traits de comparaison.
+    La période demandée (`heures` dernières heures, ou plage [debut, fin) en pd.Timestamp locaux,
+    même d'un seul jour) ne change PAS la référence : elle ne sert qu'à choisir les heures
+    affichées. Les heures plus anciennes que la référence (et les ~18 premières heures de celle-ci,
+    perdues par les moyennes glissantes) sont affichées sans score.
 
-    Pour chaque heure : pas et mouvement mesurés, pas attendus (routine de l'animal à cette heure),
-    score d'anomalie et indicateur d'anomalie. Les heures invalides (trop peu de messages) ont
-    valide=False et aucune valeur : à afficher en gris, pas en zéro."""
+    pas_attendus ne montre que le profil horaire (prof_1h) de la routine ; le modèle utilise aussi
+    les profils sur 6 h et les médianes sur 24 h.
+    Retourne None si l'animal n'a aucune mesure sur la période affichée."""
     bundle = charger_modele()
-    reference_local = _reference_locale(reference)
+    maintenant = pd.Timestamp.now(tz=FUSEAU).tz_localize(None)
+    ref_debut = maintenant - pd.Timedelta(hours=HEURES_DEFAUT)
     if debut is not None:
-        fin_local = pd.Timestamp(fin)
-        if getattr(fin_local, "tzinfo", None) is not None:
-            fin_local = fin_local.tz_convert(FUSEAU).tz_localize(None)
-        if fin_local > reference_local:
-            fin_local = reference_local
-        df = lire_mesures(mesures, animal_id=animal_id, fin_local=fin_local,
-                          debut_local=debut - pd.Timedelta(hours=HEURES_CONTEXTE))
+        aff_debut, aff_fin = debut, fin
     else:
-        debut_local = reference_local - pd.Timedelta(hours=heures)
-        df = lire_mesures(mesures, animal_id=animal_id, fin_local=reference_local,
-                          debut_local=debut_local)
-    if df.empty:
+        aff_debut, aff_fin = maintenant - pd.Timedelta(hours=heures), maintenant
+
+    # 1) données de la référence (7 derniers jours)
+    df_ref = lire_mesures(mesures, HEURES_DEFAUT, animal_id)
+    # 2) données à afficher : la référence + ce qui est plus ancien si la période le demande
+    if aff_debut < ref_debut:
+        df_old = lire_mesures(mesures, animal_id=animal_id, debut_local=aff_debut,
+                              fin_local=min(ref_debut, aff_fin))
+        df_aff = pd.concat([df_old, df_ref], ignore_index=True)
+    else:
+        df_aff = df_ref
+    if df_aff.empty:
         return None
 
-    brut = agreger_horaire(df)                                   # toutes les heures, NaN si invalide
-    brut = brut[["timestamp", "steps", "mi"]]
-    nb_valides_total = int(brut["steps"].notna().sum())
-    if debut is not None:                                        # on n'affiche que la plage demandée
-        brut = brut[(brut["timestamp"] >= debut) & (brut["timestamp"] < fin_local)]
-        if brut.empty:
-            return None
-    heures_affichees = int(brut["steps"].notna().sum())
+    brut_tout = agreger_horaire(df_aff)[["timestamp", "steps", "mi"]]    # NaN = heure invalide
+    nb_valides = int(brut_tout.loc[brut_tout["timestamp"] >= ref_debut, "steps"].notna().sum())
+    brut = brut_tout[(brut_tout["timestamp"] >= aff_debut) & (brut_tout["timestamp"] < aff_fin)]
+    if brut.empty:
+        return None
+
+    reference = {"debut": ref_debut.isoformat(), "fin": maintenant.isoformat(),
+                 "heures": HEURES_DEFAUT}
 
     X = pd.DataFrame()
-    if nb_valides_total >= MIN_HEURES_REF:
-        X = preparer(df)                                         # heures scorables uniquement
+    if nb_valides >= MIN_HEURES_REF and not df_ref.empty:
+        X = preparer(df_ref)                                     # heures scorables de la référence
     if X.empty:
         points = [{"heure": t.isoformat(), "valide": bool(pd.notna(s)), "pas": _nb(s, 1), "mi": _nb(m, 1),
                    "pas_attendus": None, "score": None, "alerte": None}
                   for t, s, m in brut.itertuples(index=False)]
         return {"animal_id": animal_id, "statut": "historique_insuffisant",
-                "raison": f"moins de {MIN_HEURES_REF} h valides : routine non calculable",
-                "heures_valides": heures_affichees, "points": points,
-                "reference_fin": reference_local.isoformat()}
+                "raison": f"{nb_valides} h valides sur les {HEURES_DEFAUT // 24} derniers jours "
+                          f"(minimum {MIN_HEURES_REF} h) : routine non calculable",
+                "heures_valides": nb_valides, "reference": reference, "points": points}
 
     X = X.copy()
     X["score"] = -bundle["modele"].decision_function(X[bundle["features"]])
     X["alerte"] = bundle["modele"].predict(X[bundle["features"]]) == -1
 
+    # routine de l'animal : pas attendus pour chaque heure de la journée (médiane de ses propres heures)
     routine = X.groupby(X["timestamp"].dt.hour)["prof_1h"].first()
     scores = X.set_index("timestamp")[["score", "alerte"]]
 
@@ -212,38 +175,26 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
         attendu = routine.get(t.hour)
         sc = scores.loc[t] if t in scores.index else None
         points.append({
-            "heure": t.isoformat(),
+            "heure": t.isoformat(),                              # heure LOCALE de l'élevage
             "valide": bool(pd.notna(s)),
             "pas": _nb(s, 1), "mi": _nb(m, 1),
             "pas_attendus": _nb(np.expm1(attendu), 1) if attendu is not None and pd.notna(attendu) else None,
             "score": _nb(sc["score"], 3) if sc is not None else None,
             "alerte": bool(sc["alerte"]) if sc is not None else None})
 
-    ref_statut = reference_local
-    if debut is None and heures == HEURES_DEFAUT:
-        statut = _statut_animal(mesures, animal_id, reference=ref_statut)
-        if statut is None:
-            statut = {"statut": "normal", "heures_alerte_24h": 0, "score_max_24h": None}
-        dern = X[X["timestamp"] > ref_statut - pd.Timedelta(hours=24)]
-    else:
-        dern = X[X["timestamp"] > X["timestamp"].max() - pd.Timedelta(hours=24)]
-        statut = _statut_animal(mesures, animal_id, reference=ref_statut)
-        if statut is None:
-            statut = {"statut": "normal", "heures_alerte_24h": 0, "score_max_24h": None}
-    h_alerte = int(dern["alerte"].sum()) if not dern.empty else 0
-    payload = {
+    dern = X[X["timestamp"] > X["timestamp"].max() - pd.Timedelta(hours=24)]
+    h_alerte = int(dern["alerte"].sum())
+    return {
         "animal_id": animal_id,
-        "statut": statut.get("statut", "normal"),
-        "heures_alerte_24h": statut.get("heures_alerte_24h", h_alerte),
-        "score_max_24h": statut.get("score_max_24h", _nb(dern["score"].max(), 3) if not dern.empty else None),
-        "seuil_score": 0.0,
+        "statut": "a_surveiller" if h_alerte >= SEUIL_HEURES_ALERTE else "normal",
+        "heures_alerte_24h": h_alerte,
+        "score_max_24h": _nb(dern["score"].max(), 3),
+        "seuil_score": 0.0,                  # score > 0 = heure anormale
         "seuil_heures": SEUIL_HEURES_ALERTE,
-        "heures_valides": heures_affichees,
+        "heures_valides": nb_valides,        # heures valides de la référence (7 jours)
+        "reference": reference,
         "fuseau": FUSEAU,
-        "reference_fin": reference_local.isoformat(),
-        "points": points,
-    }
-    return payload
+        "points": points}
 
 
 def creer_router(mesures, appliquer_alerte=None):
@@ -280,14 +231,8 @@ def creer_router(mesures, appliquer_alerte=None):
         """Historique d'activité heure par heure d'un animal, avec les heures anormales.
 
         Soit `heures` (dernières heures), soit `debut` et `fin` (dates locales, fin EXCLUE).
-
-        Le bloc de statut/alerte pour les 24 dernières heures est calculé avec la fenêtre
-        standard HEURES_DEFAUT (168 h) se terminant à l'heure de référence locale actuelle,
-        même lorsque la courbe demandée est plus longue ou tabulée sur une plage. Les points
-        affichés continuent d'utiliser la fenêtre demandée ; la routine de la courbe correspond
-        au profil horaire seul, alors que le modèle de détection s'appuie aussi sur les profils
-        sur 6 h et les médianes sur 24 h.
-        """
+        La référence est toujours celle des 7 derniers jours : la période choisie (même un seul
+        jour) ne fait que sélectionner les heures affichées."""
         d = f = None
         if (debut is None) != (fin is None):
             raise HTTPException(400, "debut et fin doivent être fournis ensemble.")
@@ -304,9 +249,8 @@ def creer_router(mesures, appliquer_alerte=None):
                 raise HTTPException(400, f"Période limitée à {HEURES_MAX // 24} jours.")
         elif heures < HEURES_MIN or heures > HEURES_MAX:
             raise HTTPException(400, f"heures doit être compris entre {HEURES_MIN} et {HEURES_MAX} (reçu : {heures}).")
-        reference = _reference_locale()
         try:
-            res = calculer_historique(mesures, animal_id, heures, d, f, reference)
+            res = calculer_historique(mesures, animal_id, heures, d, f)
         except FileNotFoundError:
             raise HTTPException(503, "Modèle introuvable : lancer entrainer_modele_final.py d'abord.")
         except ValueError as e:
