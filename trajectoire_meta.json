@@ -1,0 +1,23 @@
+{
+  "N": 12,
+  "intervalle_s": 300,
+  "features": [
+    "dx_m",
+    "dy_m",
+    "dt_s",
+    "sin_heure",
+    "cos_heure"
+  ],
+  "heure_locale": true,
+  "cache": 32,
+  "couches": 2,
+  "dropout": 0.0,
+  "variante": "2couches",
+  "graine": 4,
+  "s_xy": 51.20790116446579,
+  "s_dt": 300.000001,
+  "seuil_m": 194.7809207402474,
+  "seuil_regle_m": 262.861450718196,
+  "taux_fausses_alertes_par_position": 0.01,
+  "limites": "un seul jeu de données (bovins, grands pâturages) ; anomalies de test synthétiques"
+}

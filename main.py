@@ -16,6 +16,7 @@ from DBSCAN import analyser_troupeaux, deplacement_inhabituel, est_immobile
 from geofence import analyser_point, valider_sommets
 from IA.ia_routes import creer_router, calculer_bilan, SEUIL_HEURES_ALERTE   # AJOUT IA
 from params import BORNES, DEFAUTS, valider_parametres
+import trajectoire_service                                   # AJOUT LSTM
 
 MQTT_HOST = os.getenv("MQTT_HOST", "ycf81881.ala.eu-central-1.emqxsl.com")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
@@ -33,6 +34,11 @@ IA_AUTO = os.getenv("IA_AUTO", "true").lower() != "false"          # IA_AUTO=fal
 INTERVALLE_BILAN_IA_S = int(os.getenv("IA_INTERVALLE_S", "3600"))  # une fois par heure
 DELAI_PREMIER_BILAN_S = 60                                         # laisse le serveur démarrer
 DUREE_CONSERVATION_MESURES_S = 30 * 24 * 3600                      # TTL de mesures_activite : 30 jours
+
+# AJOUT LSTM : alerte « mouvement agité », évaluée toutes les 15 min
+LSTM_AUTO = os.getenv("LSTM_AUTO", "true").lower() != "false"
+INTERVALLE_LSTM_S = int(os.getenv("LSTM_INTERVALLE_S", "900"))
+DELAI_PREMIER_LSTM_S = 90
 
 mongo_client = MongoClient(MONGO_URI, tz_aware=True)
 base = mongo_client["traceur_gps"]
@@ -203,6 +209,31 @@ async def surveillance_ia():
         except Exception as erreur:
             print(f"Erreur bilan IA : {erreur}")
         await asyncio.sleep(INTERVALLE_BILAN_IA_S)
+
+
+def appliquer_alerte_lstm(animal_id, condition, message):
+    """AJOUT LSTM : branche l'alerte sur le système d'alertes existant (mode actif seulement)."""
+    doc = positions.find_one({"animal_id": animal_id}, {"_id": 0}, sort=[("timestamp", -1)])
+    if not doc:
+        return
+    doc["timestamp"] = datetime.now(timezone.utc)
+    gerer_alerte(animal_id, "mouvement_agite", condition, message, Position(**doc))
+
+
+def executer_cycle_lstm():
+    """AJOUT LSTM : un cycle d'analyse des trajectoires (silencieux par défaut)."""
+    return trajectoire_service.executer_cycle(base, rappel=appliquer_alerte_lstm)
+
+
+async def surveillance_lstm():
+    """AJOUT LSTM : lance le cycle à intervalle régulier."""
+    await asyncio.sleep(DELAI_PREMIER_LSTM_S)
+    while True:
+        try:
+            await asyncio.to_thread(executer_cycle_lstm)
+        except Exception as erreur:
+            print(f"Erreur cycle LSTM : {erreur}")
+        await asyncio.sleep(INTERVALLE_LSTM_S)
 
 
 def creer_index_ttl():
@@ -453,10 +484,13 @@ async def lifespan(app: FastAPI):
     mqtt_client.loop_start()
     tache = asyncio.create_task(surveillance_colliers())
     tache_ia = asyncio.create_task(surveillance_ia()) if IA_AUTO else None   # AJOUT IA AUTO
+    tache_lstm = asyncio.create_task(surveillance_lstm()) if LSTM_AUTO else None   # AJOUT LSTM
     yield
     tache.cancel()
     if tache_ia:
         tache_ia.cancel()
+    if tache_lstm:
+        tache_lstm.cancel()
     mqtt_client.loop_stop()
     mqtt_client.disconnect()
     mongo_client.close()
