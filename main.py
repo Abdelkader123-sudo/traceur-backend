@@ -583,7 +583,11 @@ def lire_alertes(animal_id: Optional[str] = None, actives: bool = False, limite:
     if actives:
         filtre["resolue"] = False
     return list(alerts.find(filtre, {"_id": 0}).sort("timestamp", -1).limit(limite))
-
+@app.get("/lstm/evenements")
+def lire_evenements_lstm(animal_id: Optional[str] = None, limite: int = 50):
+    filtre = {"animal_id": animal_id} if animal_id else {}
+    return list(base["lstm_evenements"].find(filtre, {"_id": 0})
+                .sort("$natural", -1).limit(limite))
 
 # ---------------------------------------------------------------------------
 # Fiches des animaux (type, sexe, âge, poids)
