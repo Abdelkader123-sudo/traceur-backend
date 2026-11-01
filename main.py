@@ -221,9 +221,10 @@ def appliquer_alerte_lstm(animal_id, condition, message):
 
 
 def executer_cycle_lstm():
-    """AJOUT LSTM : un cycle d'analyse des trajectoires (silencieux par défaut)."""
-    return trajectoire_service.executer_cycle(base, rappel=appliquer_alerte_lstm)
-
+    """AJOUT LSTM : un cycle d'analyse des trajectoires."""
+    bilan = trajectoire_service.executer_cycle(base)
+    print(f"Cycle LSTM : {bilan}")
+    return bilan
 
 async def surveillance_lstm():
     """AJOUT LSTM : lance le cycle à intervalle régulier."""
