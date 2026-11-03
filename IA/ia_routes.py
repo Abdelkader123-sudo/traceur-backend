@@ -17,8 +17,12 @@ Routes :
     GET /ia/historique/{animal_id}?heures=336
     GET /ia/historique/{animal_id}?debut=2026-10-24&fin=2026-10-28
                                    -> plage de dates (heure locale ; fin EXCLUE, 30 jours max)
-    Dans tous les cas la référence = les N derniers jours du réglage « reference_jours » (7 par défaut),
-    même calcul que l'alerte automatique.
+
+Référence : les N derniers jours du réglage « reference_jours » (7 par défaut), comptés jusqu'à la
+DERNIÈRE MESURE disponible (et non jusqu'à l'heure actuelle). Avec des colliers qui envoient en continu,
+c'est la même chose ; si les mesures s'arrêtent (simulation éteinte, collier hors service), la courbe
+et la routine restent calculées sur les derniers jours réellement enregistrés. Même calcul pour
+l'alerte automatique et pour la page. L'alerte « collier silencieux » signale l'arrêt des mesures.
 """
 import os
 from datetime import datetime, timedelta, timezone
@@ -43,6 +47,7 @@ SEUIL_HEURES_ALERTE = 3      # nb d'heures en alerte sur 24 h pour classer « à
 HEURES_DEFAUT = 168          # 7 jours : durée de référence par défaut (sans réglage enregistré)
 HEURES_MAX = 720             # 30 jours : limite pour éviter des calculs trop lourds
 HEURES_MIN = MIN_HEURES_REF + 24   # 96 h : 72 h valides + ~18 h perdues par la moyenne glissante sur 24 h
+_EPS = pd.Timedelta(seconds=1)     # la borne de fin des requêtes est exclusive
 _bundle = None
 _jours_reference = None      # callable sans argument -> nombre de jours (posé par creer_router)
 
@@ -74,10 +79,21 @@ def _vers_utc(t_local):
     return t_local.tz_localize(FUSEAU).tz_convert("UTC").to_pydatetime()
 
 
+def fin_donnees(mesures):
+    """Heure locale (naïve) de la dernière mesure d'activité enregistrée ; None s'il n'y en a aucune."""
+    doc = mesures.find_one({}, {"_id": 0, "timestamp": 1}, sort=[("timestamp", -1)])
+    if not doc:
+        return None
+    t = pd.Timestamp(doc["timestamp"])
+    t = t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+    return t.tz_convert(FUSEAU).tz_localize(None)
+
+
 def lire_mesures(mesures, heures=None, animal_id=None, debut_local=None, fin_local=None):
     """Lit les mesures dans MongoDB, au format attendu par scorer().
 
-    Soit les `heures` dernières heures, soit la plage [debut_local, fin_local) en heure locale."""
+    Soit les `heures` dernières heures (avant maintenant), soit la plage [debut_local, fin_local)
+    en heure locale."""
     if debut_local is not None:
         filtre = {"timestamp": {"$gte": _vers_utc(debut_local), "$lt": _vers_utc(fin_local)}}
     else:
@@ -98,11 +114,15 @@ def lire_mesures(mesures, heures=None, animal_id=None, debut_local=None, fin_loc
 def calculer_bilan(mesures, heures=None):
     """Retourne (animaux, ignores) ; lève FileNotFoundError si le modèle est absent.
 
-    heures=None : durée de référence courante (réglage « reference_jours », 7 jours par défaut)."""
+    heures=None : durée de référence courante (réglage « reference_jours », 7 jours par défaut),
+    comptée jusqu'à la dernière mesure disponible."""
     if heures is None:
         heures = heures_reference_courantes()
     bundle = charger_modele()
-    df = lire_mesures(mesures, heures)
+    fin = fin_donnees(mesures)
+    if fin is None:
+        return [], []
+    df = lire_mesures(mesures, debut_local=fin - pd.Timedelta(hours=heures), fin_local=fin + _EPS)
     if df.empty:
         return [], []
     res = scorer(bundle, df)
@@ -129,14 +149,14 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
                         reference_heures=None):
     """Courbe heure par heure d'UN animal, jugée par rapport à une référence FIXE.
 
-    Référence : les `reference_heures` qui précèdent MAINTENANT (None = durée de référence courante,
-    7 jours par défaut). C'est exactement le calcul de l'alerte automatique (calculer_bilan), donc la
-    page et l'alerte donnent le même verdict.
+    Référence : les `reference_heures` qui précèdent la DERNIÈRE MESURE enregistrée (None = durée de
+    référence courante, 7 jours par défaut). C'est exactement le calcul de l'alerte automatique
+    (calculer_bilan), donc la page et l'alerte donnent le même verdict.
 
-    La période demandée (`heures` dernières heures, ou plage [debut, fin) en pd.Timestamp locaux,
-    même d'un seul jour) ne change PAS la référence : elle ne sert qu'à choisir les heures
-    affichées. Les heures plus anciennes que la référence (et les ~18 premières heures de celle-ci,
-    perdues par les moyennes glissantes) sont affichées sans score.
+    La période affichée (`heures` dernières heures avant la dernière mesure, ou plage [debut, fin) en
+    pd.Timestamp locaux, même d'un seul jour) ne change PAS la référence : elle ne sert qu'à choisir
+    les heures affichées. Les heures plus anciennes que la référence (et les ~18 premières heures de
+    celle-ci, perdues par les moyennes glissantes) sont affichées sans score.
 
     pas_attendus ne montre que le profil horaire (prof_1h) de la routine ; le modèle utilise aussi
     les profils sur 6 h et les médianes sur 24 h.
@@ -144,15 +164,17 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
     if reference_heures is None:
         reference_heures = heures_reference_courantes()
     bundle = charger_modele()
-    maintenant = pd.Timestamp.now(tz=FUSEAU).tz_localize(None)
-    ref_debut = maintenant - pd.Timedelta(hours=reference_heures)
+    fin_ref = fin_donnees(mesures)
+    if fin_ref is None:
+        return None
+    ref_debut = fin_ref - pd.Timedelta(hours=reference_heures)
     if debut is not None:
         aff_debut, aff_fin = debut, fin
     else:
-        aff_debut, aff_fin = maintenant - pd.Timedelta(hours=heures), maintenant
+        aff_debut, aff_fin = fin_ref - pd.Timedelta(hours=heures), fin_ref + _EPS
 
-    # 1) données de la référence (N derniers jours)
-    df_ref = lire_mesures(mesures, reference_heures, animal_id)
+    # 1) données de la référence (N derniers jours enregistrés)
+    df_ref = lire_mesures(mesures, animal_id=animal_id, debut_local=ref_debut, fin_local=fin_ref + _EPS)
     # 2) données à afficher : la référence + ce qui est plus ancien si la période le demande
     if aff_debut < ref_debut:
         df_old = lire_mesures(mesures, animal_id=animal_id, debut_local=aff_debut,
@@ -169,8 +191,9 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
     if brut.empty:
         return None
 
-    reference = {"debut": ref_debut.isoformat(), "fin": maintenant.isoformat(),
-                 "heures": reference_heures}
+    maintenant = pd.Timestamp.now(tz=FUSEAU).tz_localize(None)
+    reference = {"debut": ref_debut.isoformat(), "fin": fin_ref.isoformat(), "heures": reference_heures,
+                 "retard_h": round(max(0.0, (maintenant - fin_ref).total_seconds() / 3600), 1)}
     reference_jours = reference_heures // 24
 
     X = pd.DataFrame()
@@ -181,12 +204,12 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
                    "pas_attendus": None, "score": None, "alerte": None}
                   for t, s, m in brut.itertuples(index=False)]
         if nb_valides < MIN_HEURES_REF:
-            raison = (f"{nb_valides} h valides sur les {reference_jours} derniers jours "
+            raison = (f"{nb_valides} h valides sur les {reference_jours} derniers jours enregistrés "
                       f"(minimum {MIN_HEURES_REF} h) : routine non calculable")
         else:
             # Le décompte brut passe le minimum, mais les premières heures de la référence sont
             # perdues par les moyennes glissantes : il en reste trop peu pour calculer la routine.
-            raison = (f"{nb_valides} h valides sur les {reference_jours} derniers jours : "
+            raison = (f"{nb_valides} h valides sur les {reference_jours} derniers jours enregistrés : "
                       f"insuffisant. Les premières heures de la référence sont perdues par les "
                       f"moyennes glissantes ; il faut environ {HEURES_MIN} h valides. "
                       f"Augmentez la durée de la référence.")
@@ -242,7 +265,7 @@ def creer_router(mesures, appliquer_alerte=None, jours_reference=None):
 
     @router.get("/bilan")
     def bilan(heures: Optional[int] = None, enregistrer: bool = False):
-        """Animaux dont le comportement est inhabituel sur les 24 dernières heures.
+        """Animaux dont le comportement est inhabituel sur les 24 dernières heures enregistrées.
 
         `heures` absent = durée de référence courante (réglage « reference_jours »)."""
         if heures is None:
@@ -274,8 +297,9 @@ def creer_router(mesures, appliquer_alerte=None, jours_reference=None):
         """Historique d'activité heure par heure d'un animal, avec les heures anormales.
 
         Soit `heures` (dernières heures affichées), soit `debut` et `fin` (dates locales, fin EXCLUE).
-        La référence est toujours celle du réglage « reference_jours » (7 jours par défaut) : la
-        période choisie (même un seul jour) ne fait que sélectionner les heures affichées."""
+        La référence est toujours celle du réglage « reference_jours » (7 jours par défaut), comptée
+        jusqu'à la dernière mesure : la période choisie (même un seul jour) ne fait que sélectionner
+        les heures affichées."""
         d = f = None
         if (debut is None) != (fin is None):
             raise HTTPException(400, "debut et fin doivent être fournis ensemble.")
