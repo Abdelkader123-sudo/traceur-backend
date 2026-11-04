@@ -2,13 +2,15 @@ import asyncio
 import json
 import math
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 import paho.mqtt.client as mqtt
-from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException,
+                     WebSocket, WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
 from pymongo import MongoClient
@@ -30,6 +32,11 @@ CA_FILE = os.getenv("CA_FILE", "emqxsl-ca.crt")
 MONGO_URI = os.environ["MONGO_URI"]
 
 RAYON_TERRE_M = 6_371_000          # AJOUT ZONE AUTO
+
+# AJOUT ZONE AUTO : la zone de pâturage est gérée uniquement par le serveur.
+ZONE_AUTO = os.getenv("ZONE_AUTO", "true").lower() != "false"   # ZONE_AUTO=false : plus de création auto
+ZONE_MARGE_M = float(os.getenv("ZONE_MARGE_M", "300"))          # marge autour du grand troupeau
+ADMIN_KEY = os.getenv("ADMIN_KEY")                              # clé pour modifier la zone à la main (facultatif)
 
 INTERVALLE_VERIF_COLLIERS_S = 60   # vérification des colliers silencieux
 
@@ -605,25 +612,43 @@ def _poser_zone(nom, sommets, mode, marge_m):
 
 
 def maj_zone_auto(principal):
-    """Appelée depuis verifier_troupeau : recalcule la zone automatique
-    (au plus toutes les INTERVALLE_MAJ_ZONE_S secondes) autour du grand troupeau."""
-    zone = zone_active()
-    if not zone or zone.get("mode") != "auto" or not principal:
+    """Appelée depuis verifier_troupeau.
+    - aucune zone : en crée une automatique autour du grand troupeau ;
+    - zone automatique : la recalcule (au plus toutes les INTERVALLE_MAJ_ZONE_S s).
+    Une zone manuelle (posée par l'administrateur) n'est jamais touchée."""
+    if not principal:
         return
     if time.monotonic() - _maj_zone["t"] < INTERVALLE_MAJ_ZONE_S:
         return
-    _maj_zone["t"] = time.monotonic()
+    zone = zone_active()
     sommets = _rectangle_autour(
         principal["centre_lat"], principal["centre_lon"], principal["rayon_m"],
-        zone.get("marge_m") or MARGE_AUTO_DEFAUT_M)
+        ZONE_MARGE_M)
+    if not zone:
+        if ZONE_AUTO:
+            _poser_zone("Zone de pâturage", sommets, "auto", ZONE_MARGE_M)
+            _reverifier_pature_tous()
+        return
+    if zone.get("mode") != "auto":
+        return
+    _maj_zone["t"] = time.monotonic()
     coords = [{"latitude": a, "longitude": b} for a, b in sommets]
-    pasture.update_one({"active": True}, {"$set": {"coordinates": coords}})
-    zone = {**zone, "coordinates": coords}
+    pasture.update_one({"active": True},
+                       {"$set": {"coordinates": coords, "marge_m": ZONE_MARGE_M}})
+    zone = {**zone, "coordinates": coords, "marge_m": ZONE_MARGE_M}
     _cache_zone["zone"] = zone
     diffuseur.publier({"type": "pature", "data": _zone_publique(zone)})
 
 
-@app.post("/pastures")
+def exiger_admin(x_admin_key: Optional[str] = Header(None)):
+    """Modifier la zone à la main est réservé à l'administrateur (en-tête X-Admin-Key).
+    Sans ADMIN_KEY définie, toute modification manuelle est refusée."""
+    if not ADMIN_KEY or not secrets.compare_digest(x_admin_key or "", ADMIN_KEY):
+        raise HTTPException(status_code=403,
+                            detail="Zone gérée automatiquement par le serveur.")
+
+
+@app.post("/pastures", dependencies=[Depends(exiger_admin)])
 def creer_pature(donnees: dict):
     """mode « auto » : {"mode":"auto","marge_m":300}
     mode « manuel » : {"coordinates":[{"latitude":..,"longitude":..}, ...]}"""
@@ -643,7 +668,7 @@ def creer_pature(donnees: dict):
     return {"statut": "ok", "mode": mode, "marge_m": marge, "sommets": len(sommets)}
 
 
-@app.put("/pastures")
+@app.put("/pastures", dependencies=[Depends(exiger_admin)])
 def modifier_pature(donnees: dict):
     """Modifie la zone active :
     - {"mode":"auto","marge_m":500}      : automatique, nouvelle marge
@@ -682,7 +707,7 @@ def lire_pature():
     return _zone_publique(zone)
 
 
-@app.delete("/pastures")
+@app.delete("/pastures", dependencies=[Depends(exiger_admin)])
 def supprimer_pature():
     """Désactive la zone, résout les alertes hors_pature, prévient les clients."""
     pasture.update_many({"active": True}, {"$set": {"active": False}})
