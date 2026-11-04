@@ -1,6 +1,8 @@
 import asyncio
 import json
+import math
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
@@ -26,6 +28,8 @@ MQTT_TOPIC = os.getenv("MQTT_TOPIC", "farm/+/data")
 CA_FILE = os.getenv("CA_FILE", "emqxsl-ca.crt")
 
 MONGO_URI = os.environ["MONGO_URI"]
+
+RAYON_TERRE_M = 6_371_000          # AJOUT ZONE AUTO
 
 INTERVALLE_VERIF_COLLIERS_S = 60   # vérification des colliers silencieux
 
@@ -226,6 +230,7 @@ def executer_cycle_lstm():
     print(f"Cycle LSTM : {bilan}")
     return bilan
 
+
 async def surveillance_lstm():
     """AJOUT LSTM : lance le cycle à intervalle régulier."""
     await asyncio.sleep(DELAI_PREMIER_LSTM_S)
@@ -306,6 +311,13 @@ def verifier_troupeau(p, reevaluation=False):
                 "animaux_actifs": len(actuelles)}})
         return
     principal, autres, ecarts = analyser_troupeaux(actuelles, prm)
+
+    # AJOUT ZONE AUTO : la zone de pâturage automatique suit le grand troupeau
+    try:
+        maj_zone_auto(principal)
+    except Exception as erreur:
+        print(f"Erreur maj_zone_auto : {erreur}")
+
     if not reevaluation:
         diffuseur.publier({"type": "troupeau", "data": {
             "statut": "ok", "animaux_actifs": len(actuelles),
@@ -509,33 +521,157 @@ app.include_router(creer_router(mesures_activite, appliquer_alerte_ia,
                                 lambda: P()["reference_jours"]))
 
 
-@app.post("/pastures")
-def creer_pature(donnees: dict):
-    """Enregistre la zone (remplace l'ancienne) et revérifie tous les animaux."""
-    try:
-        sommets = valider_sommets(donnees.get("coordinates"))
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    zone = {
-        "name": str(donnees.get("name") or "Zone de pâturage")[:80],
-        "coordinates": [{"latitude": a, "longitude": b} for a, b in sommets],
-        "cree_le": datetime.now(timezone.utc),
-        "active": True,
-    }
-    pasture.update_many({"active": True}, {"$set": {"active": False}})
-    pasture.insert_one(dict(zone))
-    _cache_zone["zone"], _cache_zone["charge"] = zone, True
+# ---------------------------------------------------------------------------
+# Zone de pâturage : automatique (suit le grand troupeau) ou manuelle (fixe)
+# AJOUT ZONE AUTO
+# ---------------------------------------------------------------------------
+MARGE_AUTO_DEFAUT_M = 300
+MARGE_BORNES_M = (20, 5000)
+INTERVALLE_MAJ_ZONE_S = 30          # recalcul de la zone automatique
+_maj_zone = {"t": 0.0}
 
+
+def _zone_publique(zone):
+    """Ce que voient les clients (REST + WebSocket)."""
+    return {"name": zone["name"], "coordinates": zone["coordinates"],
+            "mode": zone.get("mode", "manuel"), "marge_m": zone.get("marge_m")}
+
+
+def _rectangle_autour(clat, clon, rayon_m, marge_m):
+    """Rectangle (4 sommets) centré sur le groupe, de demi-côté rayon + marge."""
+    r = rayon_m + marge_m
+    d_lat = math.degrees(r / RAYON_TERRE_M)
+    d_lon = math.degrees(r / (RAYON_TERRE_M * math.cos(math.radians(clat))))
+    return [(clat - d_lat, clon - d_lon), (clat + d_lat, clon - d_lon),
+            (clat + d_lat, clon + d_lon), (clat - d_lat, clon + d_lon)]
+
+
+def _lire_marge(valeur):
+    try:
+        m = float(valeur)
+    except (TypeError, ValueError):
+        raise ValueError("Marge invalide.")
+    bas, haut = MARGE_BORNES_M
+    if not bas <= m <= haut:
+        raise ValueError(f"La marge doit être comprise entre {bas} et {haut} m.")
+    return m
+
+
+def _grand_troupeau():
+    """Zone (centre, rayon) du grand troupeau actuel, ou None."""
+    derniere = positions.find_one({}, {"_id": 0}, sort=[("timestamp", -1)])
+    if not derniere:
+        return None
+    actuelles = positions_actuelles(derniere["timestamp"])
+    if len(actuelles) < P()["min_animaux_troupeau"]:
+        return None
+    return analyser_troupeaux(actuelles, P())[0]
+
+
+def _sommets_auto(marge_m):
+    principal = _grand_troupeau()
+    if principal is None:
+        raise ValueError("Pas assez d'animaux actifs pour calculer la zone automatique.")
+    return _rectangle_autour(principal["centre_lat"], principal["centre_lon"],
+                             principal["rayon_m"], marge_m)
+
+
+def _reverifier_pature_tous():
     for animal_id in positions.distinct("animal_id"):
         d = positions.find_one({"animal_id": animal_id}, sort=[("timestamp", -1)])
         if d:
             try:
                 verifier_pature(Position(**{k: d[k] for k in Position.model_fields}))
             except Exception as e:
-                print(f"Vérification initiale ignorée : {e}")
-    diffuseur.publier({"type": "pature", "data": {
-        "name": zone["name"], "coordinates": zone["coordinates"]}})
-    return {"statut": "ok", "sommets": len(sommets)}
+                print(f"Vérification pâturage ignorée : {e}")
+
+
+def _poser_zone(nom, sommets, mode, marge_m):
+    """Remplace la zone active (création ou modification) et prévient les clients."""
+    zone = {
+        "name": nom,
+        "coordinates": [{"latitude": a, "longitude": b} for a, b in sommets],
+        "cree_le": datetime.now(timezone.utc),
+        "active": True,
+        "mode": mode,
+        "marge_m": marge_m,
+    }
+    pasture.update_many({"active": True}, {"$set": {"active": False}})
+    pasture.insert_one(dict(zone))
+    _cache_zone["zone"], _cache_zone["charge"] = zone, True
+    _maj_zone["t"] = time.monotonic()
+    diffuseur.publier({"type": "pature", "data": _zone_publique(zone)})
+    return zone
+
+
+def maj_zone_auto(principal):
+    """Appelée depuis verifier_troupeau : recalcule la zone automatique
+    (au plus toutes les INTERVALLE_MAJ_ZONE_S secondes) autour du grand troupeau."""
+    zone = zone_active()
+    if not zone or zone.get("mode") != "auto" or not principal:
+        return
+    if time.monotonic() - _maj_zone["t"] < INTERVALLE_MAJ_ZONE_S:
+        return
+    _maj_zone["t"] = time.monotonic()
+    sommets = _rectangle_autour(
+        principal["centre_lat"], principal["centre_lon"], principal["rayon_m"],
+        zone.get("marge_m") or MARGE_AUTO_DEFAUT_M)
+    coords = [{"latitude": a, "longitude": b} for a, b in sommets]
+    pasture.update_one({"active": True}, {"$set": {"coordinates": coords}})
+    zone = {**zone, "coordinates": coords}
+    _cache_zone["zone"] = zone
+    diffuseur.publier({"type": "pature", "data": _zone_publique(zone)})
+
+
+@app.post("/pastures")
+def creer_pature(donnees: dict):
+    """mode « auto » : {"mode":"auto","marge_m":300}
+    mode « manuel » : {"coordinates":[{"latitude":..,"longitude":..}, ...]}"""
+    mode = "auto" if donnees.get("mode") == "auto" else "manuel"
+    try:
+        if mode == "auto":
+            marge = _lire_marge(donnees.get("marge_m", MARGE_AUTO_DEFAUT_M))
+            sommets = _sommets_auto(marge)
+        else:
+            marge = None
+            sommets = valider_sommets(donnees.get("coordinates"))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    nom = str(donnees.get("name") or "Zone de pâturage")[:80]
+    _poser_zone(nom, sommets, mode, marge)
+    _reverifier_pature_tous()
+    return {"statut": "ok", "mode": mode, "marge_m": marge, "sommets": len(sommets)}
+
+
+@app.put("/pastures")
+def modifier_pature(donnees: dict):
+    """Modifie la zone active :
+    - {"mode":"auto","marge_m":500}      : automatique, nouvelle marge
+    - {"coordinates":[...]}              : coins déplacés → zone manuelle
+    - {"mode":"manuel"}                  : fige la zone actuelle"""
+    actuelle = zone_active()
+    if not actuelle:
+        raise HTTPException(status_code=404, detail="Aucune zone enregistrée.")
+    if "coordinates" in donnees:
+        mode = "manuel"
+    else:
+        mode = "auto" if donnees.get("mode", actuelle.get("mode")) == "auto" else "manuel"
+    nom = str(donnees.get("name") or actuelle["name"])[:80]
+    try:
+        marge = None
+        if mode == "auto":
+            marge = _lire_marge(donnees.get(
+                "marge_m", actuelle.get("marge_m") or MARGE_AUTO_DEFAUT_M))
+            sommets = _sommets_auto(marge)
+        elif "coordinates" in donnees:
+            sommets = valider_sommets(donnees["coordinates"])
+        else:
+            sommets = [(c["latitude"], c["longitude"]) for c in actuelle["coordinates"]]
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    _poser_zone(nom, sommets, mode, marge)
+    _reverifier_pature_tous()
+    return {"statut": "ok", "mode": mode, "marge_m": marge, "sommets": len(sommets)}
 
 
 @app.get("/pastures")
@@ -543,7 +679,7 @@ def lire_pature():
     zone = zone_active()
     if not zone:
         return {"statut": "aucune zone"}
-    return {"name": zone["name"], "coordinates": zone["coordinates"]}
+    return _zone_publique(zone)
 
 
 @app.delete("/pastures")
@@ -584,11 +720,14 @@ def lire_alertes(animal_id: Optional[str] = None, actives: bool = False, limite:
     if actives:
         filtre["resolue"] = False
     return list(alerts.find(filtre, {"_id": 0}).sort("timestamp", -1).limit(limite))
+
+
 @app.get("/lstm/evenements")
 def lire_evenements_lstm(animal_id: Optional[str] = None, limite: int = 50):
     filtre = {"animal_id": animal_id} if animal_id else {}
     return list(base["lstm_alertes_silencieuses"].find(filtre, {"_id": 0})
                 .sort("cree_le", -1).limit(limite))
+
 
 # ---------------------------------------------------------------------------
 # Fiches des animaux (type, sexe, âge, poids)
@@ -725,8 +864,7 @@ def etat_complet() -> dict:
         "positions": dernieres,
         "alertes_actives": actives,
         "troupeau": etat_troupeau(),
-        "pature": ({"name": zone["name"], "coordinates": zone["coordinates"]}
-                   if zone else None),
+        "pature": _zone_publique(zone) if zone else None,   # MODIFIÉ : mode + marge
     }
 
 
