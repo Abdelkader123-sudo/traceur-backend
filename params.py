@@ -1,17 +1,22 @@
 """Paramètres réglables depuis l'application (valeurs par défaut et bornes)."""
 
 DEFAUTS = {
+    # --- Modifiables depuis la page Réglages ---
     "eps_troupeau_m": 30,          # distance max entre deux animaux voisins (m)
     "distance_alerte_m": 120,      # écart au grand troupeau déclenchant l'alerte (m)
-    "nb_confirmations": 2,         # messages consécutifs hors zone avant alerte
-    "min_animaux_troupeau": 5,     # animaux actifs minimum pour analyser
-    "fraicheur_s": 420,            # âge max d'une position prise en compte (s)
+    "min_animaux_troupeau": 5,     # animaux minimum pour former / analyser un troupeau
     "vitesse_max": 5.0,            # km/h : déplacement rapide
-    "nb_mesures_vitesse": 3,       # mesures rapides consécutives avant alerte
-    "vitesse_repos_max": 0.3,      # km/h : en dessous, animal à l'arrêt
     "duree_immobilite_s": 1800,    # repos continu avant alerte (s)
     "delai_collier_s": 600,        # silence du collier avant alerte (s)
     "marge_pature_m": 10,          # tolérance hors zone dessinée (m)
+
+    # --- Retirés de l'interface : valeurs fixes utilisées par le backend ---
+    "nb_confirmations": 2,         # messages consécutifs hors zone avant alerte
+    "fraicheur_s": 600,            # âge max d'une position prise en compte (s)
+    "nb_mesures_vitesse": 3,       # mesures rapides consécutives avant alerte
+    "vitesse_repos_max": 0.5,      # km/h : en dessous, animal à l'arrêt
+
+    # --- Réglé depuis la page Historique d'activité ---
     "reference_jours": 7,          # durée de la référence IA (jours)
 }
 
