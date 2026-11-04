@@ -35,7 +35,7 @@ RAYON_TERRE_M = 6_371_000          # AJOUT ZONE AUTO
 
 # AJOUT ZONE AUTO : la zone de pâturage est gérée uniquement par le serveur.
 ZONE_AUTO = os.getenv("ZONE_AUTO", "true").lower() != "false"   # ZONE_AUTO=false : plus de création auto
-ZONE_MARGE_M = float(os.getenv("ZONE_MARGE_M", "300"))          # marge autour du grand troupeau
+SURFACE_PAR_ANIMAL_M2 = float(os.getenv("SURFACE_PAR_ANIMAL_M2", "400"))   # place estimée par animal
 ADMIN_KEY = os.getenv("ADMIN_KEY")                              # clé pour modifier la zone à la main (facultatif)
 
 INTERVALLE_VERIF_COLLIERS_S = 60   # vérification des colliers silencieux
@@ -529,12 +529,14 @@ app.include_router(creer_router(mesures_activite, appliquer_alerte_ia,
 
 
 # ---------------------------------------------------------------------------
-# Zone de pâturage : automatique (suit le grand troupeau) ou manuelle (fixe)
-# AJOUT ZONE AUTO
+# Zone de pâturage automatique (AJOUT ZONE AUTO)
+#   côté du carré = 2 × rayon(grand troupeau) + distance_alerte_m
+#   - rayon : fonction du NOMBRE d'animaux du grand troupeau (surface estimée par
+#     animal), jamais inférieur au rayon réellement mesuré
+#   - distance_alerte_m : réglage de l'utilisateur (page Réglages), relu à chaque calcul
 # ---------------------------------------------------------------------------
-MARGE_AUTO_DEFAUT_M = 300
-MARGE_BORNES_M = (20, 5000)
-INTERVALLE_MAJ_ZONE_S = 30          # recalcul de la zone automatique
+INTERVALLE_MAJ_ZONE_S = 30          # recalcul périodique de la zone
+TOLERANCE_REDUCTION_M = 10          # la zone ne rétrécit pas pour moins de 10 m
 _maj_zone = {"t": 0.0}
 
 
@@ -544,28 +546,29 @@ def _zone_publique(zone):
             "mode": zone.get("mode", "manuel"), "marge_m": zone.get("marge_m")}
 
 
-def _rectangle_autour(clat, clon, rayon_m, marge_m):
-    """Rectangle (4 sommets) centré sur le groupe, de demi-côté rayon + marge."""
-    r = rayon_m + marge_m
-    d_lat = math.degrees(r / RAYON_TERRE_M)
-    d_lon = math.degrees(r / (RAYON_TERRE_M * math.cos(math.radians(clat))))
+def _demi_cote_m(principal):
+    """Demi-côté du carré : rayon du troupeau + moitié de distance_alerte_m."""
+    n = max(int(principal.get("nb_animaux", 1)), 1)
+    rayon_estime = math.sqrt(n * SURFACE_PAR_ANIMAL_M2 / math.pi)
+    rayon = max(rayon_estime, float(principal.get("rayon_m", 0.0)))
+    return rayon + P()["distance_alerte_m"] / 2
+
+
+def _rectangle(clat, clon, demi_cote_m):
+    """Carré (4 sommets) centré sur (clat, clon)."""
+    d_lat = math.degrees(demi_cote_m / RAYON_TERRE_M)
+    d_lon = math.degrees(demi_cote_m / (RAYON_TERRE_M * math.cos(math.radians(clat))))
     return [(clat - d_lat, clon - d_lon), (clat + d_lat, clon - d_lon),
             (clat + d_lat, clon + d_lon), (clat - d_lat, clon + d_lon)]
 
 
-def _lire_marge(valeur):
-    try:
-        m = float(valeur)
-    except (TypeError, ValueError):
-        raise ValueError("Marge invalide.")
-    bas, haut = MARGE_BORNES_M
-    if not bas <= m <= haut:
-        raise ValueError(f"La marge doit être comprise entre {bas} et {haut} m.")
-    return m
+def _demi_cote_actuel(zone):
+    lats = [c["latitude"] for c in zone["coordinates"]]
+    return math.radians(max(lats) - min(lats)) * RAYON_TERRE_M / 2
 
 
 def _grand_troupeau():
-    """Zone (centre, rayon) du grand troupeau actuel, ou None."""
+    """Zone (centre, rayon, nb_animaux) du grand troupeau actuel, ou None."""
     derniere = positions.find_one({}, {"_id": 0}, sort=[("timestamp", -1)])
     if not derniere:
         return None
@@ -575,12 +578,12 @@ def _grand_troupeau():
     return analyser_troupeaux(actuelles, P())[0]
 
 
-def _sommets_auto(marge_m):
+def _sommets_auto():
     principal = _grand_troupeau()
     if principal is None:
         raise ValueError("Pas assez d'animaux actifs pour calculer la zone automatique.")
-    return _rectangle_autour(principal["centre_lat"], principal["centre_lon"],
-                             principal["rayon_m"], marge_m)
+    return _rectangle(principal["centre_lat"], principal["centre_lon"],
+                      _demi_cote_m(principal))
 
 
 def _reverifier_pature_tous():
@@ -593,15 +596,15 @@ def _reverifier_pature_tous():
                 print(f"Vérification pâturage ignorée : {e}")
 
 
-def _poser_zone(nom, sommets, mode, marge_m):
-    """Remplace la zone active (création ou modification) et prévient les clients."""
+def _poser_zone(nom, sommets, mode):
+    """Remplace la zone active et prévient les clients."""
     zone = {
         "name": nom,
         "coordinates": [{"latitude": a, "longitude": b} for a, b in sommets],
         "cree_le": datetime.now(timezone.utc),
         "active": True,
         "mode": mode,
-        "marge_m": marge_m,
+        "marge_m": P()["distance_alerte_m"] if mode == "auto" else None,
     }
     pasture.update_many({"active": True}, {"$set": {"active": False}})
     pasture.insert_one(dict(zone))
@@ -611,33 +614,46 @@ def _poser_zone(nom, sommets, mode, marge_m):
     return zone
 
 
-def maj_zone_auto(principal):
-    """Appelée depuis verifier_troupeau.
-    - aucune zone : en crée une automatique autour du grand troupeau ;
-    - zone automatique : la recalcule (au plus toutes les INTERVALLE_MAJ_ZONE_S s).
-    Une zone manuelle (posée par l'administrateur) n'est jamais touchée."""
+def maj_zone_auto(principal, forcer=False):
+    """Appelée depuis verifier_troupeau (au plus toutes les 30 s) et, avec
+    forcer=True, immédiatement après un changement de réglages.
+    - aucune zone : en crée une automatique ;
+    - zone automatique : la recentre et la redimensionne ;
+    Une zone manuelle (administrateur) n'est jamais touchée."""
     if not principal:
         return
-    if time.monotonic() - _maj_zone["t"] < INTERVALLE_MAJ_ZONE_S:
+    if not forcer and time.monotonic() - _maj_zone["t"] < INTERVALLE_MAJ_ZONE_S:
         return
     zone = zone_active()
-    sommets = _rectangle_autour(
-        principal["centre_lat"], principal["centre_lon"], principal["rayon_m"],
-        ZONE_MARGE_M)
+    demi = _demi_cote_m(principal)
     if not zone:
         if ZONE_AUTO:
-            _poser_zone("Zone de pâturage", sommets, "auto", ZONE_MARGE_M)
+            sommets = _rectangle(principal["centre_lat"], principal["centre_lon"], demi)
+            _poser_zone("Zone de pâturage", sommets, "auto")
             _reverifier_pature_tous()
         return
     if zone.get("mode") != "auto":
         return
     _maj_zone["t"] = time.monotonic()
+    ancien = _demi_cote_actuel(zone)
+    if not forcer and demi < ancien and ancien - demi < TOLERANCE_REDUCTION_M:
+        demi = ancien                       # évite que la zone « respire »
+    sommets = _rectangle(principal["centre_lat"], principal["centre_lon"], demi)
     coords = [{"latitude": a, "longitude": b} for a, b in sommets]
+    marge = P()["distance_alerte_m"]
     pasture.update_one({"active": True},
-                       {"$set": {"coordinates": coords, "marge_m": ZONE_MARGE_M}})
-    zone = {**zone, "coordinates": coords, "marge_m": ZONE_MARGE_M}
+                       {"$set": {"coordinates": coords, "marge_m": marge}})
+    zone = {**zone, "coordinates": coords, "marge_m": marge}
     _cache_zone["zone"] = zone
     diffuseur.publier({"type": "pature", "data": _zone_publique(zone)})
+
+
+def recalculer_zone_auto():
+    """Recalcul immédiat (changement de distance_alerte_m ou d'autres réglages)."""
+    try:
+        maj_zone_auto(_grand_troupeau(), forcer=True)
+    except Exception as e:
+        print(f"Erreur recalcul zone : {e}")
 
 
 def exiger_admin(x_admin_key: Optional[str] = Header(None)):
@@ -650,30 +666,20 @@ def exiger_admin(x_admin_key: Optional[str] = Header(None)):
 
 @app.post("/pastures", dependencies=[Depends(exiger_admin)])
 def creer_pature(donnees: dict):
-    """mode « auto » : {"mode":"auto","marge_m":300}
-    mode « manuel » : {"coordinates":[{"latitude":..,"longitude":..}, ...]}"""
+    """Administrateur. {"mode":"auto"} ou {"coordinates":[{"latitude":..,"longitude":..}, ...]}"""
     mode = "auto" if donnees.get("mode") == "auto" else "manuel"
     try:
-        if mode == "auto":
-            marge = _lire_marge(donnees.get("marge_m", MARGE_AUTO_DEFAUT_M))
-            sommets = _sommets_auto(marge)
-        else:
-            marge = None
-            sommets = valider_sommets(donnees.get("coordinates"))
+        sommets = _sommets_auto() if mode == "auto" else valider_sommets(donnees.get("coordinates"))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
-    nom = str(donnees.get("name") or "Zone de pâturage")[:80]
-    _poser_zone(nom, sommets, mode, marge)
+    _poser_zone(str(donnees.get("name") or "Zone de pâturage")[:80], sommets, mode)
     _reverifier_pature_tous()
-    return {"statut": "ok", "mode": mode, "marge_m": marge, "sommets": len(sommets)}
+    return {"statut": "ok", "mode": mode, "sommets": len(sommets)}
 
 
 @app.put("/pastures", dependencies=[Depends(exiger_admin)])
 def modifier_pature(donnees: dict):
-    """Modifie la zone active :
-    - {"mode":"auto","marge_m":500}      : automatique, nouvelle marge
-    - {"coordinates":[...]}              : coins déplacés → zone manuelle
-    - {"mode":"manuel"}                  : fige la zone actuelle"""
+    """Administrateur. {"mode":"auto"} | {"mode":"manuel"} (fige) | {"coordinates":[...]}"""
     actuelle = zone_active()
     if not actuelle:
         raise HTTPException(status_code=404, detail="Aucune zone enregistrée.")
@@ -681,22 +687,18 @@ def modifier_pature(donnees: dict):
         mode = "manuel"
     else:
         mode = "auto" if donnees.get("mode", actuelle.get("mode")) == "auto" else "manuel"
-    nom = str(donnees.get("name") or actuelle["name"])[:80]
     try:
-        marge = None
         if mode == "auto":
-            marge = _lire_marge(donnees.get(
-                "marge_m", actuelle.get("marge_m") or MARGE_AUTO_DEFAUT_M))
-            sommets = _sommets_auto(marge)
+            sommets = _sommets_auto()
         elif "coordinates" in donnees:
             sommets = valider_sommets(donnees["coordinates"])
         else:
             sommets = [(c["latitude"], c["longitude"]) for c in actuelle["coordinates"]]
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
-    _poser_zone(nom, sommets, mode, marge)
+    _poser_zone(str(donnees.get("name") or actuelle["name"])[:80], sommets, mode)
     _reverifier_pature_tous()
-    return {"statut": "ok", "mode": mode, "marge_m": marge, "sommets": len(sommets)}
+    return {"statut": "ok", "mode": mode, "sommets": len(sommets)}
 
 
 @app.get("/pastures")
@@ -813,6 +815,7 @@ def reevaluer_tous():
     """AJOUT : rejoue toutes les vérifications sur la dernière position de
     chaque animal avec les nouveaux paramètres, sans attendre le prochain
     message MQTT. Alertes ouvertes/fermées et diffusées immédiatement."""
+    recalculer_zone_auto()   # AJOUT ZONE AUTO : la zone suit distance_alerte_m tout de suite
     for animal_id in positions.distinct("animal_id"):
         d = positions.find_one({"animal_id": animal_id}, sort=[("timestamp", -1)])
         if not d:
