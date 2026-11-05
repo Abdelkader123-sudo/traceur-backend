@@ -81,6 +81,15 @@ def _vers_utc(t_local):
     return t_local.tz_localize(FUSEAU).tz_convert("UTC").to_pydatetime()
 
 
+def _dates(df):
+    """Copie du DataFrame avec une colonne `timestamp` toujours de type datetime64 (jamais « object »).
+
+    Indispensable avant agreger_horaire / preparer, qui utilisent l'accesseur .dt."""
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df
+
+
 def fin_donnees(mesures):
     """Heure locale (naïve) de la dernière mesure d'activité enregistrée ; None s'il n'y en a aucune."""
     doc = mesures.find_one({}, {"_id": 0, "timestamp": 1}, sort=[("timestamp", -1)])
@@ -130,6 +139,7 @@ def calculer_bilan(mesures, heures=None):
     df = lire_mesures(mesures, debut_local=fin - pd.Timedelta(hours=heures), fin_local=fin + _EPS)
     if df.empty:
         return [], []
+    df = _dates(df)
     res = scorer(bundle, df)
     resume = bilan_quotidien(res) if not res.empty else pd.DataFrame(columns=["heures_alerte", "score_max"])
 
@@ -184,20 +194,21 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
         aff_debut, aff_fin = fin_ref - pd.Timedelta(hours=heures), fin_ref + _EPS
 
     # 1) données de la référence (N derniers jours enregistrés)
-    df_ref = lire_mesures(mesures, animal_id=animal_id, debut_local=ref_debut, fin_local=fin_ref + _EPS)
+    df_ref = _dates(lire_mesures(mesures, animal_id=animal_id,
+                                 debut_local=ref_debut, fin_local=fin_ref + _EPS))
 
     # 2) données à afficher : la référence + ce qui est plus ancien si la période le demande.
-    #    CORRECTION : on ne concatène que si des mesures plus anciennes existent. Concaténer avec un
-    #    DataFrame vide rendait la colonne « timestamp » de type object, d'où l'erreur « .dt accessor ».
+    #    On ne concatène que si des mesures plus anciennes existent : concaténer avec un
+    #    DataFrame vide rendait la colonne « timestamp » de type object (erreur « .dt accessor »).
     df_aff = df_ref.copy()
     if aff_debut < ref_debut:
         df_old = lire_mesures(mesures, animal_id=animal_id, debut_local=aff_debut,
                               fin_local=min(ref_debut, aff_fin))
         if not df_old.empty:
-            df_aff = pd.concat([df_old, df_ref], ignore_index=True)
+            df_aff = pd.concat([_dates(df_old), df_ref], ignore_index=True)
     if df_aff.empty:
         return None
-    df_aff["timestamp"] = pd.to_datetime(df_aff["timestamp"])      # garde un vrai type date
+    df_aff = _dates(df_aff)                                      # garde un vrai type date
 
     brut_tout = agreger_horaire(df_aff)[["timestamp", "steps", "mi"]]    # NaN = heure invalide
     nb_valides = int(brut_tout.loc[brut_tout["timestamp"] >= ref_debut, "steps"].notna().sum())
