@@ -35,7 +35,7 @@ RAYON_TERRE_M = 6_371_000          # AJOUT ZONE AUTO
 
 # AJOUT ZONE AUTO : la zone de pâturage est gérée uniquement par le serveur.
 ZONE_AUTO = os.getenv("ZONE_AUTO", "true").lower() != "false"   # ZONE_AUTO=false : plus de création auto
-SURFACE_PAR_ANIMAL_M2 = float(os.getenv("SURFACE_PAR_ANIMAL_M2", "400"))   # place estimée par animal
+SURFACE_PAR_ANIMAL_M2 = float(os.getenv("SURFACE_PAR_ANIMAL_M2", "5"))   # place estimée par animal
 ADMIN_KEY = os.getenv("ADMIN_KEY")                              # clé pour modifier la zone à la main (facultatif)
 
 INTERVALLE_VERIF_COLLIERS_S = 60   # vérification des colliers silencieux
