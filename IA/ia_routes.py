@@ -1,29 +1,3 @@
-"""Routes FastAPI /ia : bilan quotidien et historique détaillé par animal (Isolation Forest).
-
-Le modèle ne dépend plus de l'identifiant ni de l'échelle du collier : la référence de chaque animal
-est calculée à chaque appel sur son propre historique (il en faut donc assez).
-
-Collection de mesures d'activité, un document par message :
-    {"animal_id": "cow01", "timestamp": datetime (UTC), "mi": 3, "steps": 1, "duree_s": 60}
-
-Branchement dans main.py :
-    app.include_router(creer_router(mesures_activite, appliquer_alerte_ia, lambda: P()["reference_jours"]))
-
-Routes :
-    GET /ia/bilan                          -> bilan des 24 dernières heures (lecture seule)
-    GET /ia/bilan?enregistrer=true         -> ouvre / résout aussi les alertes « comportement_inhabituel »
-    GET /ia/bilan?heures=240               -> fenêtre d'historique forcée (sinon : durée de référence du réglage)
-    GET /ia/historique/{animal_id}         -> courbe heure par heure : pas, routine attendue, score, anomalie
-    GET /ia/historique/{animal_id}?heures=336
-    GET /ia/historique/{animal_id}?debut=2026-10-24&fin=2026-10-28
-                                   -> plage de dates (heure locale ; fin EXCLUE, 30 jours max)
-
-Référence : les N derniers jours du réglage « reference_jours » (7 par défaut), comptés jusqu'à la
-DERNIÈRE MESURE disponible (et non jusqu'à l'heure actuelle). Avec des colliers qui envoient en continu,
-c'est la même chose ; si les mesures s'arrêtent (simulation éteinte, collier hors service), la courbe
-et la routine restent calculées sur les derniers jours réellement enregistrés. Même calcul pour
-l'alerte automatique et pour la page. L'alerte « collier silencieux » signale l'arrêt des mesures.
-"""
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -316,14 +290,16 @@ def creer_router(mesures, appliquer_alerte=None, jours_reference=None):
                 raise HTTPException(400, f"Période limitée à {HEURES_MAX // 24} jours.")
         elif heures < HEURES_MIN or heures > HEURES_MAX:
             raise HTTPException(400, f"heures doit être compris entre {HEURES_MIN} et {HEURES_MAX} (reçu : {heures}).")
+        import traceback  # en haut du fichier
+
         try:
             res = calculer_historique(mesures, animal_id, heures, d, f)
         except FileNotFoundError:
             raise HTTPException(503, "Modèle introuvable : lancer entrainer_modele_final.py d'abord.")
         except ValueError as e:
             raise HTTPException(503, str(e))
-        if res is None:
-            raise HTTPException(404, f"Aucune mesure pour {animal_id} sur cette période.")
-        return res
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(500, f"{type(e).__name__}: {e}")
 
     return router
