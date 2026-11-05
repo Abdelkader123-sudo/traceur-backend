@@ -1,4 +1,31 @@
+"""Routes FastAPI /ia : bilan quotidien et historique détaillé par animal (Isolation Forest).
+
+Le modèle ne dépend plus de l'identifiant ni de l'échelle du collier : la référence de chaque animal
+est calculée à chaque appel sur son propre historique (il en faut donc assez).
+
+Collection de mesures d'activité, un document par message :
+    {"animal_id": "cow01", "timestamp": datetime (UTC), "mi": 3, "steps": 1, "duree_s": 60}
+
+Branchement dans main.py :
+    app.include_router(creer_router(mesures_activite, appliquer_alerte_ia, lambda: P()["reference_jours"]))
+
+Routes :
+    GET /ia/bilan                          -> bilan des 24 dernières heures (lecture seule)
+    GET /ia/bilan?enregistrer=true         -> ouvre / résout aussi les alertes « comportement_inhabituel »
+    GET /ia/bilan?heures=240               -> fenêtre d'historique forcée (sinon : durée de référence du réglage)
+    GET /ia/historique/{animal_id}         -> courbe heure par heure : pas, routine attendue, score, anomalie
+    GET /ia/historique/{animal_id}?heures=336
+    GET /ia/historique/{animal_id}?debut=2026-10-24&fin=2026-10-28
+                                   -> plage de dates (heure locale ; fin EXCLUE, 30 jours max)
+
+Référence : les N derniers jours du réglage « reference_jours », comptés jusqu'à la
+DERNIÈRE MESURE disponible (et non jusqu'à l'heure actuelle). Avec des colliers qui envoient en continu,
+c'est la même chose ; si les mesures s'arrêtent (simulation éteinte, collier hors service), la courbe
+et la routine restent calculées sur les derniers jours réellement enregistrés. Même calcul pour
+l'alerte automatique et pour la page. L'alerte « collier silencieux » signale l'arrêt des mesures.
+"""
 import os
+import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -88,7 +115,7 @@ def lire_mesures(mesures, heures=None, animal_id=None, debut_local=None, fin_loc
 def calculer_bilan(mesures, heures=None):
     """Retourne (animaux, ignores) ; lève FileNotFoundError si le modèle est absent.
 
-    heures=None : durée de référence courante (réglage « reference_jours », 7 jours par défaut),
+    heures=None : durée de référence courante (réglage « reference_jours »),
     comptée jusqu'à la dernière mesure disponible."""
     if heures is None:
         heures = heures_reference_courantes()
@@ -115,8 +142,13 @@ def calculer_bilan(mesures, heures=None):
 
 
 def _nb(x, n=2):
-    """Nombre arrondi, ou None si absent (JSON n'accepte pas NaN)."""
-    return None if x is None or pd.isna(x) else round(float(x), n)
+    """Nombre arrondi, ou None si absent ou non fini (JSON n'accepte pas NaN ni inf)."""
+    if x is None or pd.isna(x):
+        return None
+    v = float(x)
+    if not np.isfinite(v):
+        return None
+    return round(v, n)
 
 
 def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fin=None,
@@ -124,8 +156,8 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
     """Courbe heure par heure d'UN animal, jugée par rapport à une référence FIXE.
 
     Référence : les `reference_heures` qui précèdent la DERNIÈRE MESURE enregistrée (None = durée de
-    référence courante, 7 jours par défaut). C'est exactement le calcul de l'alerte automatique
-    (calculer_bilan), donc la page et l'alerte donnent le même verdict.
+    référence courante). C'est exactement le calcul de l'alerte automatique (calculer_bilan), donc la
+    page et l'alerte donnent le même verdict.
 
     La période affichée (`heures` dernières heures avant la dernière mesure, ou plage [debut, fin) en
     pd.Timestamp locaux, même d'un seul jour) ne change PAS la référence : elle ne sert qu'à choisir
@@ -198,7 +230,9 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
 
     # routine de l'animal : pas attendus pour chaque heure de la journée (médiane de ses propres heures)
     routine = X.groupby(X["timestamp"].dt.hour)["prof_1h"].first()
-    scores = X.set_index("timestamp")[["score", "alerte"]]
+    # CORRECTION : un seul score par timestamp (évite que .loc renvoie plusieurs lignes)
+    scores = (X.drop_duplicates("timestamp")
+                .set_index("timestamp")[["score", "alerte"]])
 
     points = []
     for t, s, m in brut.itertuples(index=False):
@@ -254,6 +288,9 @@ def creer_router(mesures, appliquer_alerte=None, jours_reference=None):
             raise HTTPException(503, "Modèle introuvable : lancer entrainer_modele_final.py d'abord.")
         except ValueError as e:
             raise HTTPException(503, str(e))
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(500, f"{type(e).__name__}: {e}")
         if not animaux and not ignores:
             return {"animaux": [], "ignores": [], "message": "Aucune mesure récente."}
 
@@ -271,9 +308,8 @@ def creer_router(mesures, appliquer_alerte=None, jours_reference=None):
         """Historique d'activité heure par heure d'un animal, avec les heures anormales.
 
         Soit `heures` (dernières heures affichées), soit `debut` et `fin` (dates locales, fin EXCLUE).
-        La référence est toujours celle du réglage « reference_jours » (7 jours par défaut), comptée
-        jusqu'à la dernière mesure : la période choisie (même un seul jour) ne fait que sélectionner
-        les heures affichées."""
+        La référence est toujours celle du réglage « reference_jours », comptée jusqu'à la dernière
+        mesure : la période choisie (même un seul jour) ne fait que sélectionner les heures affichées."""
         d = f = None
         if (debut is None) != (fin is None):
             raise HTTPException(400, "debut et fin doivent être fournis ensemble.")
@@ -290,8 +326,6 @@ def creer_router(mesures, appliquer_alerte=None, jours_reference=None):
                 raise HTTPException(400, f"Période limitée à {HEURES_MAX // 24} jours.")
         elif heures < HEURES_MIN or heures > HEURES_MAX:
             raise HTTPException(400, f"heures doit être compris entre {HEURES_MIN} et {HEURES_MAX} (reçu : {heures}).")
-        import traceback  # en haut du fichier
-
         try:
             res = calculer_historique(mesures, animal_id, heures, d, f)
         except FileNotFoundError:
@@ -299,7 +333,12 @@ def creer_router(mesures, appliquer_alerte=None, jours_reference=None):
         except ValueError as e:
             raise HTTPException(503, str(e))
         except Exception as e:
+            # Erreur inattendue : traceback dans les logs Render, et réponse JSON
+            # (avec en-têtes CORS) au lieu d'un 500 brut vu comme « Failed to fetch ».
             traceback.print_exc()
             raise HTTPException(500, f"{type(e).__name__}: {e}")
+        if res is None:
+            raise HTTPException(404, f"Aucune mesure pour {animal_id} sur cette période.")
+        return res
 
     return router
