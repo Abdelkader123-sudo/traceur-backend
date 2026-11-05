@@ -49,6 +49,7 @@ HEURES_DEFAUT = 168          # 7 jours : durée de référence par défaut (sans
 HEURES_MAX = 720             # 30 jours : limite pour éviter des calculs trop lourds
 HEURES_MIN = MIN_HEURES_REF + 24   # 96 h : 72 h valides + ~18 h perdues par la moyenne glissante sur 24 h
 _EPS = pd.Timedelta(seconds=1)     # la borne de fin des requêtes est exclusive
+_COLONNES = ["timestamp", "cow_name", "mi", "steps", "duree_s"]
 _bundle = None
 _jours_reference = None      # callable sans argument -> nombre de jours (posé par creer_router)
 
@@ -94,7 +95,8 @@ def lire_mesures(mesures, heures=None, animal_id=None, debut_local=None, fin_loc
     """Lit les mesures dans MongoDB, au format attendu par scorer().
 
     Soit les `heures` dernières heures (avant maintenant), soit la plage [debut_local, fin_local)
-    en heure locale."""
+    en heure locale. Le DataFrame renvoyé a toujours une colonne `timestamp` de type datetime,
+    même quand il est vide."""
     if debut_local is not None:
         filtre = {"timestamp": {"$gte": _vers_utc(debut_local), "$lt": _vers_utc(fin_local)}}
     else:
@@ -105,11 +107,13 @@ def lire_mesures(mesures, heures=None, animal_id=None, debut_local=None, fin_loc
     docs = list(mesures.find(filtre,
                              {"_id": 0, "animal_id": 1, "timestamp": 1, "mi": 1, "steps": 1, "duree_s": 1}))
     if not docs:
-        return pd.DataFrame(columns=["timestamp", "cow_name", "mi", "steps", "duree_s"])
+        vide = pd.DataFrame(columns=_COLONNES)
+        vide["timestamp"] = pd.to_datetime(vide["timestamp"])      # évite une colonne « object »
+        return vide
     df = pd.DataFrame(docs).rename(columns={"animal_id": "cow_name"})
     t = pd.to_datetime(df["timestamp"], utc=True)
     df["timestamp"] = t.dt.tz_convert(FUSEAU).dt.tz_localize(None)     # heure locale, comme à l'entraînement
-    return df[[c for c in ["timestamp", "cow_name", "mi", "steps", "duree_s"] if c in df.columns]]
+    return df[[c for c in _COLONNES if c in df.columns]]
 
 
 def calculer_bilan(mesures, heures=None):
@@ -181,15 +185,19 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
 
     # 1) données de la référence (N derniers jours enregistrés)
     df_ref = lire_mesures(mesures, animal_id=animal_id, debut_local=ref_debut, fin_local=fin_ref + _EPS)
-    # 2) données à afficher : la référence + ce qui est plus ancien si la période le demande
+
+    # 2) données à afficher : la référence + ce qui est plus ancien si la période le demande.
+    #    CORRECTION : on ne concatène que si des mesures plus anciennes existent. Concaténer avec un
+    #    DataFrame vide rendait la colonne « timestamp » de type object, d'où l'erreur « .dt accessor ».
+    df_aff = df_ref.copy()
     if aff_debut < ref_debut:
         df_old = lire_mesures(mesures, animal_id=animal_id, debut_local=aff_debut,
                               fin_local=min(ref_debut, aff_fin))
-        df_aff = pd.concat([df_old, df_ref], ignore_index=True)
-    else:
-        df_aff = df_ref
+        if not df_old.empty:
+            df_aff = pd.concat([df_old, df_ref], ignore_index=True)
     if df_aff.empty:
         return None
+    df_aff["timestamp"] = pd.to_datetime(df_aff["timestamp"])      # garde un vrai type date
 
     brut_tout = agreger_horaire(df_aff)[["timestamp", "steps", "mi"]]    # NaN = heure invalide
     nb_valides = int(brut_tout.loc[brut_tout["timestamp"] >= ref_debut, "steps"].notna().sum())
@@ -230,7 +238,7 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
 
     # routine de l'animal : pas attendus pour chaque heure de la journée (médiane de ses propres heures)
     routine = X.groupby(X["timestamp"].dt.hour)["prof_1h"].first()
-    # CORRECTION : un seul score par timestamp (évite que .loc renvoie plusieurs lignes)
+    # un seul score par timestamp (évite que .loc renvoie plusieurs lignes)
     scores = (X.drop_duplicates("timestamp")
                 .set_index("timestamp")[["score", "alerte"]])
 
