@@ -44,7 +44,8 @@ INTERVALLE_VERIF_COLLIERS_S = 60   # vérification des colliers silencieux
 IA_AUTO = os.getenv("IA_AUTO", "true").lower() != "false"          # IA_AUTO=false pour le désactiver
 INTERVALLE_BILAN_IA_S = int(os.getenv("IA_INTERVALLE_S", "3600"))  # une fois par heure
 DELAI_PREMIER_BILAN_S = 60                                         # laisse le serveur démarrer
-DUREE_CONSERVATION_MESURES_S = 30 * 24 * 3600                      # TTL de mesures_activite : 30 jours
+DUREE_CONSERVATION_MESURES_S = 14 * 24 * 3600                      # TTL de mesures_activite : 14 jours
+REFERENCE_JOURS = 4                    # TTL de mesures_activite : 30 jours
 
 # AJOUT LSTM : alerte « mouvement agité », évaluée toutes les 15 min
 LSTM_AUTO = os.getenv("LSTM_AUTO", "true").lower() != "false"
@@ -66,10 +67,11 @@ _cache_zone = {"zone": None, "charge": False}
 
 
 def P() -> dict:
-    """Paramètres actifs (défauts + valeurs enregistrées par l'utilisateur)."""
+    """Paramètres actifs (défauts + valeurs enregistrées). reference_jours est fixé à 4."""
     if _cache_params["v"] is None:
         doc = parametres_col.find_one({"_id": "global"}) or {}
-        _cache_params["v"] = {**DEFAUTS, **{k: doc[k] for k in DEFAUTS if k in doc}}
+        _cache_params["v"] = {**DEFAUTS, **{k: doc[k] for k in DEFAUTS if k in doc},
+                              "reference_jours": REFERENCE_JOURS}
     return _cache_params["v"]
 
 
@@ -853,6 +855,7 @@ def modifier_parametres(donnees: dict, taches: BackgroundTasks):
         propres = valider_parametres(donnees)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    propres["reference_jours"] = REFERENCE_JOURS
     ancienne_reference = P()["reference_jours"]
     nouveaux = {**P(), **propres}
     parametres_col.update_one({"_id": "global"}, {"$set": nouveaux}, upsert=True)
@@ -867,7 +870,7 @@ def modifier_parametres(donnees: dict, taches: BackgroundTasks):
 def reinitialiser_parametres(taches: BackgroundTasks):
     ancienne_reference = P()["reference_jours"]
     parametres_col.delete_one({"_id": "global"})
-    _cache_params["v"] = dict(DEFAUTS)
+    _cache_params["v"] = {**DEFAUTS, "reference_jours": REFERENCE_JOURS}
     taches.add_task(reevaluer_tous)            # MODIFIÉ : après la réponse
     if DEFAUTS["reference_jours"] != ancienne_reference:
         taches.add_task(recalculer_alertes_ia)  # AJOUT : alertes IA recalculées tout de suite
