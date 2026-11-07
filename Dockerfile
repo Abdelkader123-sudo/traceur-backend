@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py DBSCAN.py geofence.py params.py emqxsl-ca.crt trajectoire_service.py trajectoire.onnx trajectoire_meta.json ./
+COPY main.py auth.py DBSCAN.py geofence.py params.py emqxsl-ca.crt trajectoire_service.py trajectoire.onnx trajectoire_meta.json ./
 COPY IA/ ./IA/
 
 RUN useradd -m appuser
