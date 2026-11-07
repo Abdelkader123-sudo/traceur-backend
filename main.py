@@ -52,6 +52,19 @@ LSTM_AUTO = os.getenv("LSTM_AUTO", "true").lower() != "false"
 INTERVALLE_LSTM_S = int(os.getenv("LSTM_INTERVALLE_S", "900"))
 DELAI_PREMIER_LSTM_S = 90
 
+# AJOUT NETTOYAGE : suppression automatique des anciennes données (économie de stockage)
+#   - alertes : supprimées au-delà de DUREE_ALERTES_H heures (24 h par défaut)
+#   - autres données (positions, activité, événements LSTM, anciennes zones) :
+#     supprimées au-delà de DUREE_DONNEES_H heures (170 h par défaut)
+#   - JAMAIS touchés : fiches des animaux, paramètres, état courant des animaux, zone active
+NETTOYAGE_AUTO = os.getenv("NETTOYAGE_AUTO", "true").lower() != "false"   # NETTOYAGE_AUTO=false pour le désactiver
+DUREE_ALERTES_H = float(os.getenv("DUREE_ALERTES_H", "24"))
+DUREE_DONNEES_H = float(os.getenv("DUREE_DONNEES_H", "170"))
+# true : les alertes encore actives (non résolues) ne sont jamais supprimées, même après 24 h
+GARDER_ALERTES_ACTIVES = os.getenv("GARDER_ALERTES_ACTIVES", "false").lower() == "true"
+INTERVALLE_NETTOYAGE_S = int(os.getenv("NETTOYAGE_INTERVALLE_S", "3600"))   # une fois par heure
+DELAI_PREMIER_NETTOYAGE_S = 120                                              # laisse le serveur démarrer
+
 mongo_client = MongoClient(MONGO_URI, tz_aware=True)
 base = mongo_client["traceur_gps"]
 positions = base["positions"]
@@ -61,6 +74,7 @@ animaux = base["animaux"]                      # fiches des animaux (type, sexe,
 pasture = base["pastures"]
 parametres_col = base["parametres"]
 mesures_activite = base["mesures_activite"]    # AJOUT IA : un document par message (mi, steps, duree_s)
+lstm_evenements = base["lstm_alertes_silencieuses"]   # AJOUT NETTOYAGE
 
 _cache_params = {"v": None}
 _cache_zone = {"zone": None, "charge": False}
@@ -284,6 +298,76 @@ def creer_index_animaux():
         print(f"Index animaux non créé : {erreur}")
 
 
+def creer_index_nettoyage():
+    """AJOUT NETTOYAGE : index sur la date pour que les suppressions par âge soient rapides.
+    Un échec ne doit pas empêcher le serveur de démarrer."""
+    for collection in (positions, alerts):
+        try:
+            collection.create_index("timestamp")
+        except Exception as erreur:
+            print(f"Index timestamp non créé ({collection.name}) : {erreur}")
+
+
+# ---------------------------------------------------------------------------
+# Nettoyage automatique de la base (AJOUT NETTOYAGE)
+# ---------------------------------------------------------------------------
+def nettoyer_base():
+    """Supprime les anciennes données pour économiser le stockage.
+
+    - alertes plus vieilles que DUREE_ALERTES_H (24 h)
+    - positions, mesures d'activité, événements LSTM et anciennes zones de pâturage
+      plus vieux que DUREE_DONNEES_H (170 h)
+
+    Ne touche jamais : fiches des animaux (animaux), paramètres, état courant des
+    animaux (etat_animaux) et zone de pâturage active."""
+    maintenant = datetime.now(timezone.utc)
+    limite_alertes = maintenant - timedelta(hours=DUREE_ALERTES_H)
+    limite_donnees = maintenant - timedelta(hours=DUREE_DONNEES_H)
+    bilan = {}
+
+    # --- Alertes ---
+    filtre_alertes = {"timestamp": {"$lt": limite_alertes}}
+    if GARDER_ALERTES_ACTIVES:
+        filtre_alertes["resolue"] = True
+    else:
+        # Les alertes encore actives qui vont disparaître sont retirées de l'application.
+        # Si le problème persiste, une nouvelle alerte sera créée au prochain contrôle.
+        for a in alerts.find({**filtre_alertes, "resolue": False},
+                             {"animal_id": 1, "type": 1}):
+            diffuseur.publier({"type": "alerte_resolue", "data": {
+                "animal_id": a["animal_id"],
+                "type": a["type"],
+                "resolue_le": maintenant,
+            }})
+    bilan["alertes"] = alerts.delete_many(filtre_alertes).deleted_count
+
+    # --- Autres données ---
+    bilan["positions"] = positions.delete_many(
+        {"timestamp": {"$lt": limite_donnees}}).deleted_count
+    bilan["mesures_activite"] = mesures_activite.delete_many(
+        {"timestamp": {"$lt": limite_donnees}}).deleted_count
+    bilan["evenements_lstm"] = lstm_evenements.delete_many(
+        {"cree_le": {"$lt": limite_donnees}}).deleted_count
+    bilan["anciennes_zones"] = pasture.delete_many(
+        {"active": False, "cree_le": {"$lt": limite_donnees}}).deleted_count
+
+    total = sum(bilan.values())
+    print(f"Nettoyage : {total} documents supprimés {bilan} "
+          f"(alertes > {DUREE_ALERTES_H:g} h, données > {DUREE_DONNEES_H:g} h)")
+    return bilan
+
+
+async def surveillance_nettoyage():
+    """AJOUT NETTOYAGE : lance le nettoyage à intervalle régulier."""
+    await asyncio.sleep(DELAI_PREMIER_NETTOYAGE_S)
+    while True:
+        try:
+            await asyncio.to_thread(nettoyer_base)
+        except Exception as erreur:
+            print(f"Erreur nettoyage : {erreur}")
+        await asyncio.sleep(INTERVALLE_NETTOYAGE_S)
+
+
 # ---------------------------------------------------------------------------
 # Troupeau
 # ---------------------------------------------------------------------------
@@ -504,17 +588,22 @@ async def lifespan(app: FastAPI):
         mesures_activite.create_index, [("animal_id", 1), ("timestamp", -1)]
     )      # AJOUT IA
     await asyncio.to_thread(creer_index_ttl)            # AJOUT IA AUTO
+    await asyncio.to_thread(creer_index_nettoyage)      # AJOUT NETTOYAGE
     mqtt_client.connect(MQTT_HOST, MQTT_PORT)
     mqtt_client.loop_start()
     tache = asyncio.create_task(surveillance_colliers())
     tache_ia = asyncio.create_task(surveillance_ia()) if IA_AUTO else None   # AJOUT IA AUTO
     tache_lstm = asyncio.create_task(surveillance_lstm()) if LSTM_AUTO else None   # AJOUT LSTM
+    tache_nettoyage = (asyncio.create_task(surveillance_nettoyage())
+                       if NETTOYAGE_AUTO else None)     # AJOUT NETTOYAGE
     yield
     tache.cancel()
     if tache_ia:
         tache_ia.cancel()
     if tache_lstm:
         tache_lstm.cancel()
+    if tache_nettoyage:
+        tache_nettoyage.cancel()
     mqtt_client.loop_stop()
     mqtt_client.disconnect()
     mongo_client.close()
