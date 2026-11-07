@@ -21,6 +21,7 @@ from geofence import analyser_point, valider_sommets
 from IA.ia_routes import creer_router, calculer_bilan, SEUIL_HEURES_ALERTE   # AJOUT IA
 from params import BORNES, DEFAUTS, FIXES, valider_parametres
 import trajectoire_service                                   # AJOUT LSTM
+from auth import creer_routeur                               # AJOUT AUTH
 
 MQTT_HOST = os.getenv("MQTT_HOST", "ycf81881.ala.eu-central-1.emqxsl.com")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
@@ -57,7 +58,8 @@ DELAI_PREMIER_LSTM_S = 90
 #     dépasse DUREE_ALERTES_H heures (24 h par défaut), jamais avant
 #   - autres données (positions, activité, événements LSTM, anciennes zones) :
 #     supprimées au-delà de DUREE_DONNEES_H heures (170 h par défaut)
-#   - JAMAIS touchés : fiches des animaux, paramètres, état courant des animaux, zone active
+#   - JAMAIS touchés : fiches des animaux, paramètres, état courant des animaux, zone active,
+#     et comptes utilisateurs (collection « utilisateurs »)
 NETTOYAGE_AUTO = os.getenv("NETTOYAGE_AUTO", "true").lower() != "false"   # NETTOYAGE_AUTO=false pour le désactiver
 DUREE_ALERTES_H = float(os.getenv("DUREE_ALERTES_H", "24"))
 DUREE_DONNEES_H = float(os.getenv("DUREE_DONNEES_H", "170"))
@@ -319,7 +321,7 @@ def nettoyer_base():
       plus vieux que DUREE_DONNEES_H (170 h)
 
     Ne touche jamais : fiches des animaux (animaux), paramètres, état courant des
-    animaux (etat_animaux) et zone de pâturage active."""
+    animaux (etat_animaux), zone de pâturage active et comptes utilisateurs."""
     maintenant = datetime.now(timezone.utc)
     limite_alertes = maintenant - timedelta(hours=DUREE_ALERTES_H)
     limite_donnees = maintenant - timedelta(hours=DUREE_DONNEES_H)
@@ -617,6 +619,8 @@ app.add_middleware(
 # AJOUT IA : /ia/bilan, /ia/historique ; la durée de référence est lue à chaque appel
 app.include_router(creer_router(mesures_activite, appliquer_alerte_ia,
                                 lambda: P()["reference_jours"]))
+# AJOUT AUTH : /auth/etat, /auth/inscription, /auth/connexion, /auth/moi, /utilisateurs
+app.include_router(creer_routeur(base))
 
 
 # ---------------------------------------------------------------------------
