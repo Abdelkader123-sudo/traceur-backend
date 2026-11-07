@@ -8,9 +8,9 @@ DEFAUTS = {
     "vitesse_max": 5.0,            # km/h : déplacement rapide
     "duree_immobilite_s": 1800,    # repos continu avant alerte (s)
     "delai_collier_s": 600,        # silence du collier avant alerte (s)
-    "marge_pature_m": 10,          # tolérance hors zone dessinée (m)
 
     # --- Retirés de l'interface : valeurs fixes utilisées par le backend ---
+    "marge_pature_m": 10,          # tolérance hors zone dessinée (m) - fixe, non modifiable
     "nb_confirmations": 2,         # messages consécutifs hors zone avant alerte
     "fraicheur_s": 600,            # âge max d'une position prise en compte (s)
     "nb_mesures_vitesse": 3,       # mesures rapides consécutives avant alerte
@@ -20,7 +20,12 @@ DEFAUTS = {
     "reference_jours": 7,          # durée de la référence IA (jours)
 }
 
+# Paramètres dont la valeur est toujours celle de DEFAUTS : une ancienne valeur
+# enregistrée dans la base de données est ignorée.
+FIXES = {"marge_pature_m"}
+
 # clé: (minimum, maximum, entier ?)
+# Seuls les paramètres présents ici peuvent être modifiés par l'application.
 BORNES = {
     "eps_troupeau_m": (2, 500, False),
     "distance_alerte_m": (5, 5000, False),
@@ -32,7 +37,6 @@ BORNES = {
     "vitesse_repos_max": (0, 5, False),
     "duree_immobilite_s": (60, 86400, True),
     "delai_collier_s": (60, 86400, True),
-    "marge_pature_m": (0, 500, False),
     # minimum 5 j : avec 72 h valides requises, 3 j donneraient toujours « historique insuffisant » ;
     # à 4 j (96 h) il ne reste aucune marge pour les heures sans mesure, car le modèle perd ~18 h
     # au démarrage de ses moyennes glissantes.

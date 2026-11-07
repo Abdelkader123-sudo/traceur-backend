@@ -19,7 +19,7 @@ from pymongo.errors import OperationFailure
 from DBSCAN import analyser_troupeaux, deplacement_inhabituel, est_immobile
 from geofence import analyser_point, valider_sommets
 from IA.ia_routes import creer_router, calculer_bilan, SEUIL_HEURES_ALERTE   # AJOUT IA
-from params import BORNES, DEFAUTS, valider_parametres
+from params import BORNES, DEFAUTS, FIXES, valider_parametres
 import trajectoire_service                                   # AJOUT LSTM
 
 MQTT_HOST = os.getenv("MQTT_HOST", "ycf81881.ala.eu-central-1.emqxsl.com")
@@ -67,10 +67,12 @@ _cache_zone = {"zone": None, "charge": False}
 
 
 def P() -> dict:
-    """Paramètres actifs (défauts + valeurs enregistrées). reference_jours est fixé à 4."""
+    """Paramètres actifs (défauts + valeurs enregistrées). reference_jours est fixé à 4.
+    Les paramètres de FIXES (ex. marge_pature_m) gardent toujours leur valeur par défaut."""
     if _cache_params["v"] is None:
         doc = parametres_col.find_one({"_id": "global"}) or {}
-        _cache_params["v"] = {**DEFAUTS, **{k: doc[k] for k in DEFAUTS if k in doc},
+        _cache_params["v"] = {**DEFAUTS,
+                              **{k: doc[k] for k in DEFAUTS if k in doc and k not in FIXES},
                               "reference_jours": REFERENCE_JOURS}
     return _cache_params["v"]
 
@@ -864,17 +866,6 @@ def modifier_parametres(donnees: dict, taches: BackgroundTasks):
     if nouveaux["reference_jours"] != ancienne_reference:
         taches.add_task(recalculer_alertes_ia)  # AJOUT : alertes IA recalculées tout de suite
     return {"statut": "ok", "valeurs": nouveaux}
-
-
-@app.post("/parametres/reinitialiser")
-def reinitialiser_parametres(taches: BackgroundTasks):
-    ancienne_reference = P()["reference_jours"]
-    parametres_col.delete_one({"_id": "global"})
-    _cache_params["v"] = {**DEFAUTS, "reference_jours": REFERENCE_JOURS}
-    taches.add_task(reevaluer_tous)            # MODIFIÉ : après la réponse
-    if DEFAUTS["reference_jours"] != ancienne_reference:
-        taches.add_task(recalculer_alertes_ia)  # AJOUT : alertes IA recalculées tout de suite
-    return {"statut": "ok", "valeurs": DEFAUTS}
 
 
 def etat_complet() -> dict:
