@@ -45,7 +45,7 @@ IA_AUTO = os.getenv("IA_AUTO", "true").lower() != "false"          # IA_AUTO=fal
 INTERVALLE_BILAN_IA_S = int(os.getenv("IA_INTERVALLE_S", "3600"))  # une fois par heure
 DELAI_PREMIER_BILAN_S = 60                                         # laisse le serveur démarrer
 DUREE_CONSERVATION_MESURES_S = 14 * 24 * 3600                      # TTL de mesures_activite : 14 jours
-REFERENCE_JOURS = 4                    # TTL de mesures_activite : 30 jours
+REFERENCE_JOURS = 4
 
 # AJOUT LSTM : alerte « mouvement agité », évaluée toutes les 15 min
 LSTM_AUTO = os.getenv("LSTM_AUTO", "true").lower() != "false"
@@ -53,16 +53,15 @@ INTERVALLE_LSTM_S = int(os.getenv("LSTM_INTERVALLE_S", "900"))
 DELAI_PREMIER_LSTM_S = 90
 
 # AJOUT NETTOYAGE : suppression automatique des anciennes données (économie de stockage)
-#   - alertes : supprimées au-delà de DUREE_ALERTES_H heures (24 h par défaut)
+#   - alertes (TOUS types, actives ou résolues) : supprimées uniquement quand leur âge
+#     dépasse DUREE_ALERTES_H heures (24 h par défaut), jamais avant
 #   - autres données (positions, activité, événements LSTM, anciennes zones) :
 #     supprimées au-delà de DUREE_DONNEES_H heures (170 h par défaut)
 #   - JAMAIS touchés : fiches des animaux, paramètres, état courant des animaux, zone active
 NETTOYAGE_AUTO = os.getenv("NETTOYAGE_AUTO", "true").lower() != "false"   # NETTOYAGE_AUTO=false pour le désactiver
 DUREE_ALERTES_H = float(os.getenv("DUREE_ALERTES_H", "24"))
 DUREE_DONNEES_H = float(os.getenv("DUREE_DONNEES_H", "170"))
-# true : les alertes encore actives (non résolues) ne sont jamais supprimées, même après 24 h
-GARDER_ALERTES_ACTIVES = os.getenv("GARDER_ALERTES_ACTIVES", "false").lower() == "true"
-INTERVALLE_NETTOYAGE_S = int(os.getenv("NETTOYAGE_INTERVALLE_S", "3600"))   # une fois par heure
+INTERVALLE_NETTOYAGE_S = int(os.getenv("NETTOYAGE_INTERVALLE_S", "600"))   # toutes les 10 min
 DELAI_PREMIER_NETTOYAGE_S = 120                                              # laisse le serveur démarrer
 
 mongo_client = MongoClient(MONGO_URI, tz_aware=True)
@@ -268,7 +267,7 @@ async def surveillance_lstm():
 
 
 def creer_index_ttl():
-    """AJOUT IA AUTO : supprime automatiquement les mesures d'activité de plus de 30 jours.
+    """AJOUT IA AUTO : supprime automatiquement les mesures d'activité de plus de 14 jours.
 
     Si un index simple « timestamp_1 » existe déjà sans TTL (code 85), on le remplace."""
     try:
@@ -282,7 +281,7 @@ def creer_index_ttl():
             mesures_activite.drop_index("timestamp_1")
             mesures_activite.create_index(
                 "timestamp", expireAfterSeconds=DUREE_CONSERVATION_MESURES_S)
-            print("Index TTL mesures_activite converti (30 jours)")
+            print("Index TTL mesures_activite converti (14 jours)")
         except Exception as erreur2:
             print(f"Index TTL mesures_activite non converti : {erreur2}")
     except Exception as erreur:
@@ -314,7 +313,8 @@ def creer_index_nettoyage():
 def nettoyer_base():
     """Supprime les anciennes données pour économiser le stockage.
 
-    - alertes plus vieilles que DUREE_ALERTES_H (24 h)
+    - alertes de TOUS types, actives ou résolues : supprimées uniquement quand leur
+      âge dépasse DUREE_ALERTES_H (24 h). Avant 24 h, elles ne sont jamais touchées.
     - positions, mesures d'activité, événements LSTM et anciennes zones de pâturage
       plus vieux que DUREE_DONNEES_H (170 h)
 
@@ -325,20 +325,18 @@ def nettoyer_base():
     limite_donnees = maintenant - timedelta(hours=DUREE_DONNEES_H)
     bilan = {}
 
-    # --- Alertes ---
+    # --- Alertes : uniquement celles dont l'âge dépasse DUREE_ALERTES_H ---
     filtre_alertes = {"timestamp": {"$lt": limite_alertes}}
-    if GARDER_ALERTES_ACTIVES:
-        filtre_alertes["resolue"] = True
-    else:
-        # Les alertes encore actives qui vont disparaître sont retirées de l'application.
-        # Si le problème persiste, une nouvelle alerte sera créée au prochain contrôle.
-        for a in alerts.find({**filtre_alertes, "resolue": False},
-                             {"animal_id": 1, "type": 1}):
-            diffuseur.publier({"type": "alerte_resolue", "data": {
-                "animal_id": a["animal_id"],
-                "type": a["type"],
-                "resolue_le": maintenant,
-            }})
+
+    # Les alertes encore actives qui vont disparaître sont retirées de l'application.
+    # Si le problème persiste, une nouvelle alerte sera créée au prochain contrôle.
+    for a in alerts.find({**filtre_alertes, "resolue": False},
+                         {"animal_id": 1, "type": 1}):
+        diffuseur.publier({"type": "alerte_resolue", "data": {
+            "animal_id": a["animal_id"],
+            "type": a["type"],
+            "resolue_le": maintenant,
+        }})
     bilan["alertes"] = alerts.delete_many(filtre_alertes).deleted_count
 
     # --- Autres données ---
@@ -847,6 +845,14 @@ def lire_evenements_lstm(animal_id: Optional[str] = None, limite: int = 50):
     filtre = {"animal_id": animal_id} if animal_id else {}
     return list(base["lstm_alertes_silencieuses"].find(filtre, {"_id": 0})
                 .sort("cree_le", -1).limit(limite))
+
+
+# AJOUT NETTOYAGE : lancer le nettoyage à la demande (administrateur, en-tête X-Admin-Key)
+@app.post("/nettoyage", dependencies=[Depends(exiger_admin)])
+def lancer_nettoyage():
+    """Exécute nettoyer_base() immédiatement et renvoie le nombre de documents
+    supprimés par collection."""
+    return nettoyer_base()
 
 
 # ---------------------------------------------------------------------------
