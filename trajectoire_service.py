@@ -1,11 +1,19 @@
 """Alerte « mouvement agité » (LSTM de trajectoire) pour le backend FastAPI.
 
-Principe : toutes les 15 min, pour chaque animal, on évalue TOUTES les nouvelles positions (≈ 3, au pas de 5 min),
-dans l'ordre. L'alerte s'ouvre quand l'erreur de prédiction dépasse le seuil sur K positions CONSÉCUTIVES.
+Principe : à chaque cycle (l'intervalle est fixé dans main.py, variable LSTM_INTERVALLE_S), pour chaque animal,
+on évalue TOUTES les nouvelles positions, dans l'ordre. L'alerte s'ouvre quand l'erreur de prédiction dépasse
+le seuil sur K positions CONSÉCUTIVES.
 L'état (série en cours, dernière position évaluée) est gardé dans MongoDB entre deux exécutions.
 
 MODE_SILENCIEUX = True : les alertes sont enregistrées à part, sans notifier l'utilisateur (à garder pendant la
 phase de recalibrage avec les vraies données du collier).
+
+Réglages par variables d'environnement (tous facultatifs) :
+    LSTM_K            positions suspectes consécutives avant alerte      (défaut 1)
+    LSTM_HISTORIQUE_H heures de positions relues à chaque cycle          (défaut 6)
+    LSTM_ADAPTATIF    "true" = seuil propre à chaque animal              (défaut false)
+    LSTM_PLANCHER_M   seuil minimal en mètres si adaptatif               (défaut 70)
+    LSTM_FACTEUR      seuil = facteur × erreur typique de l'animal       (défaut 4)
 
 Dépendances : numpy, onnxruntime, pymongo (déjà présent), tzdata (pip install tzdata) pour le fuseau Africa/Tunis.
 Fichiers à déployer à côté de ce module : trajectoire.onnx (UN seul fichier) et trajectoire_meta.json.
@@ -28,11 +36,16 @@ FICHIER_META = os.path.join(DOSSIER, "trajectoire_meta.json")
 
 N = 12                  # déplacements d'historique (identique à l'entraînement)
 DT_MAX = 900            # s : au-delà, la série est coupée (identique à l'entraînement)
-K = 4                   # positions consécutives au-dessus du seuil
+K = int(os.getenv("LSTM_K", "1"))                          # positions consécutives au-dessus du seuil
 MODE_SILENCIEUX = True
-HISTORIQUE_H = 6        # heures de positions relues à chaque cycle
+HISTORIQUE_H = int(os.getenv("LSTM_HISTORIQUE_H", "6"))    # heures de positions relues à chaque cycle
 RATTRAPAGE_MIN = 60     # au tout premier cycle d'un animal : on n'évalue que la dernière heure
 TZ_LOCAL = ZoneInfo("Africa/Tunis")   # le modèle utilise l'heure LOCALE (sinus/cosinus de l'heure)
+
+# Seuil adaptatif : seuil de l'animal = min(seuil du modèle, max(plancher, facteur × erreur typique de l'animal))
+ADAPTATIF = os.getenv("LSTM_ADAPTATIF", "false").lower() == "true"   # éteint par défaut
+PLANCHER_M = float(os.getenv("LSTM_PLANCHER_M", "70"))               # seuil minimal (m)
+FACTEUR = float(os.getenv("LSTM_FACTEUR", "4"))                      # multiple de l'erreur typique
 
 # ----------------------------------------------------------------------------- MongoDB (À ADAPTER)
 COLL_POSITIONS = "positions"
@@ -122,6 +135,17 @@ def fenetres(F):
     return np.stack([F[i - N:i] for i in v]), F[v, :2], v
 
 
+# ----------------------------------------------------------------------------- seuil adaptatif
+def seuil_adaptatif(erreurs, seuil_max):
+    """Seuil propre à l'animal : max(plancher, facteur × médiane de ses erreurs), plafonné au seuil du modèle.
+
+    Si l'option est éteinte ou s'il y a moins de 5 erreurs, on garde le seuil du modèle."""
+    if not ADAPTATIF or len(erreurs) < 5:
+        return seuil_max
+    typique = float(np.median(erreurs))
+    return min(seuil_max, max(PLANCHER_M, FACTEUR * typique))
+
+
 # ----------------------------------------------------------------------------- logique d'alerte (sans base de données)
 def evaluer_animal(positions, etat, predire, seuil, k=K):
     """Évalue les nouvelles positions d'UN animal.
@@ -144,7 +168,9 @@ def evaluer_animal(positions, etat, predire, seuil, k=K):
     garder = [j for j, i in enumerate(idx) if instants[i] > derniere]
     if not garder:
         return etat, []
-    erreurs = np.linalg.norm(predire(X[garder]) - Y[garder], axis=1)
+    toutes = np.linalg.norm(predire(X) - Y, axis=1)     # erreurs de toutes les fenêtres (estime l'erreur typique)
+    erreurs = toutes[garder]
+    seuil = seuil_adaptatif(toutes, seuil)              # seuil propre à cet animal (= seuil du modèle si éteint)
 
     serie, prec, alertes = int(etat.get("serie", 0)), derniere, []
     for e, j in zip(erreurs, garder):
@@ -163,7 +189,7 @@ def evaluer_animal(positions, etat, predire, seuil, k=K):
 
 # ----------------------------------------------------------------------------- cycle complet (MongoDB, pymongo synchrone)
 def executer_cycle(db, predire=None, seuil=None):
-    """À appeler toutes les 15 min. `db` = base pymongo. Retourne un petit bilan."""
+    """À appeler à intervalle régulier. `db` = base pymongo. Retourne un petit bilan."""
     modele = predire or charger_modele()
     seuil = seuil if seuil is not None else modele.seuil
     depuis = datetime.now(timezone.utc) - timedelta(hours=HISTORIQUE_H)
@@ -181,6 +207,9 @@ def executer_cycle(db, predire=None, seuil=None):
                 t = t.replace(tzinfo=timezone.utc)
             positions.append({"timestamp": t, "lat": d.get(CHAMP_LAT), "lon": d.get(CHAMP_LON)})
         ancien = db[COLL_ETAT].find_one({"_id": animal}) or {}
+        dc = ancien.get("derniere_cible")
+        if dc is not None and dc.tzinfo is not None:      # relue « aware » (client tz_aware) : on revient à l'heure locale naïve du service
+            ancien["derniere_cible"] = dc.replace(tzinfo=None)
         etat, alertes = evaluer_animal(positions, ancien, modele, seuil)
         db[COLL_ETAT].replace_one({"_id": animal}, {**etat, "maj": datetime.now(timezone.utc)}, upsert=True)
         if alertes:
