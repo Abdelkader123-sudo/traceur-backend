@@ -252,7 +252,9 @@ def appliquer_alerte_lstm(animal_id, condition, message):
 
 def executer_cycle_lstm():
     """AJOUT LSTM : un cycle d'analyse des trajectoires."""
-    bilan = trajectoire_service.executer_cycle(base)
+    seuil = os.getenv("LSTM_SEUIL_M")          # vide = seuil du modèle
+    bilan = trajectoire_service.executer_cycle(
+        base, seuil=float(seuil) if seuil else None)
     print(f"Cycle LSTM : {bilan}")
     return bilan
 
@@ -1002,3 +1004,40 @@ async def ws_endpoint(ws: WebSocket):
         pass
     finally:
         diffuseur.clients.discard(ws)
+        
+        
+# À COLLER dans main.py, juste après la route /lstm/evenements (lire_evenements_lstm).
+# Aucun import à ajouter : datetime, timedelta, timezone, HTTPException,
+# trajectoire_service et la collection `positions` existent déjà dans main.py.
+
+
+@app.get("/lstm/trajectoire")
+def lire_trajectoire_lstm(animal_id: str, instant_local: str,
+                          avant_min: int = 90, apres_min: int = 15):
+    """Positions de l'animal autour d'une alerte (heures renvoyées en heure locale, sans fuseau)."""
+    tz = trajectoire_service.TZ_LOCAL
+    try:
+        local = datetime.fromisoformat(instant_local).replace(tzinfo=None)   # déjà local
+    except ValueError:
+        raise HTTPException(status_code=422, detail="instant_local invalide")
+    centre = local.replace(tzinfo=tz).astimezone(timezone.utc)
+    docs = positions.find(
+        {"animal_id": animal_id,
+         "timestamp": {"$gte": centre - timedelta(minutes=avant_min),
+                       "$lte": centre + timedelta(minutes=apres_min)}},
+        {"_id": 0, "timestamp": 1, "lat": 1, "lon": 1},
+    ).sort("timestamp", 1)
+
+    points = []
+    for d in docs:
+        if d.get("lat") is None or d.get("lon") is None:
+            continue
+        t = d["timestamp"]
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        points.append({
+            "t": t.astimezone(tz).replace(tzinfo=None).isoformat(timespec="seconds"),
+            "lat": d["lat"],
+            "lon": d["lon"],
+        })
+    return points
