@@ -168,7 +168,8 @@ def evaluer_animal(positions, etat, predire, seuil, k=K):
     garder = [j for j, i in enumerate(idx) if instants[i] > derniere]
     if not garder:
         return etat, []
-    toutes = np.linalg.norm(predire(X) - Y, axis=1)     # erreurs de toutes les fenêtres (estime l'erreur typique)
+    previsions = predire(X)
+    toutes = np.linalg.norm(previsions - Y, axis=1)     # erreurs de toutes les fenêtres (estime l'erreur typique)
     erreurs = toutes[garder]
     seuil = seuil_adaptatif(toutes, seuil)              # seuil propre à cet animal (= seuil du modèle si éteint)
 
@@ -179,8 +180,15 @@ def evaluer_animal(positions, etat, predire, seuil, k=K):
         if e > seuil:
             serie = serie + 1 if (consecutif and serie > 0) else 1
             if serie == k:
+                lat_depart, lon_depart = pts[i][1], pts[i][2]
+                lat_reelle, lon_reelle = pts[i + 1][1], pts[i + 1][2]
+                dx_prevu, dy_prevu = map(float, previsions[j])
+                m_lon = 111320.0 * np.cos(np.radians(pts[0][1]))
                 alertes.append({"instant_local": instants[i], "erreur_m": float(e),
-                                "seuil_m": float(seuil), "k": k})
+                                "seuil_m": float(seuil), "k": k,
+                                "reel_lat": lat_reelle, "reel_lon": lon_reelle,
+                                "prevu_lat": lat_depart + dy_prevu / 111320.0,
+                                "prevu_lon": lon_depart + dx_prevu / m_lon})
         else:
             serie = 0
         prec = instants[i]
