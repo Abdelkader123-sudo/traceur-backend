@@ -16,7 +16,7 @@
   "graine": 4,
   "s_xy": 51.20790116446579,
   "s_dt": 300.000001,
-  "seuil_m": 194.7809207402474,
+  "seuil_m": 100,
   "seuil_regle_m": 262.861450718196,
   "taux_fausses_alertes_par_position": 0.01,
   "limites": "un seul jeu de données (bovins, grands pâturages) ; anomalies de test synthétiques"
