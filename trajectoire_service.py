@@ -196,40 +196,55 @@ def evaluer_animal(positions, etat, predire, seuil, k=K):
 
 
 # ----------------------------------------------------------------------------- cycle complet (MongoDB, pymongo synchrone)
-def executer_cycle(db, predire=None, seuil=None):
+def executer_cycle(db, predire=None, seuil=None, client_id=None):
     """À appeler à intervalle régulier. `db` = base pymongo. Retourne un petit bilan."""
     modele = predire or charger_modele()
     seuil = seuil if seuil is not None else modele.seuil
     depuis = datetime.now(timezone.utc) - timedelta(hours=HISTORIQUE_H)
+    filtre = {CHAMP_TEMPS: {"$gte": depuis}}
+    if client_id is not None:
+        filtre["client_id"] = client_id
     curseur = db[COLL_POSITIONS].find(
-        {CHAMP_TEMPS: {"$gte": depuis}},
-        {CHAMP_ANIMAL: 1, CHAMP_TEMPS: 1, CHAMP_LAT: 1, CHAMP_LON: 1}
-    ).sort([(CHAMP_ANIMAL, 1), (CHAMP_TEMPS, 1)])
+        filtre,
+        {CHAMP_ANIMAL: 1, "client_id": 1, "numero_client": 1,
+         CHAMP_TEMPS: 1, CHAMP_LAT: 1, CHAMP_LON: 1}
+    ).sort([("client_id", 1), (CHAMP_ANIMAL, 1), (CHAMP_TEMPS, 1)])
 
     bilan = {"animaux": 0, "alertes": 0}
-    for animal, docs in groupby(curseur, key=lambda d: d[CHAMP_ANIMAL]):
+    for (tenant, animal), docs in groupby(
+        curseur, key=lambda d: (d.get("client_id"), d[CHAMP_ANIMAL])
+    ):
+        identifiant_etat = f"{tenant}:{animal}"
         positions = []
+        numero_client = None
         for d in docs:
             t = d[CHAMP_TEMPS]
             if t.tzinfo is None:                      # pymongo renvoie des dates naïves = UTC
                 t = t.replace(tzinfo=timezone.utc)
             positions.append({"timestamp": t, "lat": d.get(CHAMP_LAT), "lon": d.get(CHAMP_LON)})
-        ancien = db[COLL_ETAT].find_one({"_id": animal}) or {}
+            numero_client = d.get("numero_client", numero_client)
+        ancien = db[COLL_ETAT].find_one({"_id": identifiant_etat}) or {}
         dc = ancien.get("derniere_cible")
         if dc is not None and dc.tzinfo is not None:      # relue « aware » (client tz_aware) : on revient à l'heure locale naïve du service
             ancien["derniere_cible"] = dc.replace(tzinfo=None)
         etat, alertes = evaluer_animal(positions, ancien, modele, seuil)
-        db[COLL_ETAT].replace_one({"_id": animal}, {**etat, "maj": datetime.now(timezone.utc)}, upsert=True)
+        db[COLL_ETAT].replace_one(
+            {"_id": identifiant_etat},
+            {**etat, "client_id": tenant, "animal_id": animal,
+             "maj": datetime.now(timezone.utc)},
+            upsert=True)
         if alertes:
-            enregistrer_alertes(db, animal, alertes)
+            enregistrer_alertes(db, animal, alertes, tenant, numero_client)
         bilan["animaux"] += 1
         bilan["alertes"] += len(alertes)
     log.info("cycle LSTM : %s", bilan)
     return bilan
 
 
-def enregistrer_alertes(db, animal, alertes):
-    docs = [{"animal_id": animal, "type": "mouvement_agite_lstm", **a, "cree_le": datetime.now(timezone.utc)}
+def enregistrer_alertes(db, animal, alertes, client_id, numero_client):
+    docs = [{"animal_id": animal, "type": "mouvement_agite_lstm",
+             "client_id": client_id, "numero_client": numero_client,
+             **a, "cree_le": datetime.now(timezone.utc)}
             for a in alertes]
     if MODE_SILENCIEUX:
         db[COLL_ALERTES_SILENCIEUSES].insert_many(docs)     # visibles seulement pour analyse, aucune notification

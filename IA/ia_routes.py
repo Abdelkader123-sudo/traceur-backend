@@ -32,7 +32,7 @@ from typing import Optional
 import joblib
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 try:                                            # import en tant que package (IA.ia_routes)
     from .entrainer_modele_final import (scorer, bilan_quotidien, preparer,
@@ -54,11 +54,11 @@ _bundle = None
 _jours_reference = None      # callable sans argument -> nombre de jours (posé par creer_router)
 
 
-def heures_reference_courantes():
+def heures_reference_courantes(client_id=None):
     """Durée de la référence en heures : réglage utilisateur lu à l'instant, sinon HEURES_DEFAUT."""
     if _jours_reference is not None:
         try:
-            heures = int(_jours_reference()) * 24
+            heures = int(_jours_reference(client_id)) * 24
             if HEURES_MIN <= heures <= HEURES_MAX:
                 return heures
         except Exception:
@@ -90,9 +90,10 @@ def _dates(df):
     return df
 
 
-def fin_donnees(mesures):
+def fin_donnees(mesures, client_id=None):
     """Heure locale (naïve) de la dernière mesure d'activité enregistrée ; None s'il n'y en a aucune."""
-    doc = mesures.find_one({}, {"_id": 0, "timestamp": 1}, sort=[("timestamp", -1)])
+    filtre = {"client_id": client_id} if client_id is not None else {}
+    doc = mesures.find_one(filtre, {"_id": 0, "timestamp": 1}, sort=[("timestamp", -1)])
     if not doc:
         return None
     t = pd.Timestamp(doc["timestamp"])
@@ -100,7 +101,8 @@ def fin_donnees(mesures):
     return t.tz_convert(FUSEAU).tz_localize(None)
 
 
-def lire_mesures(mesures, heures=None, animal_id=None, debut_local=None, fin_local=None):
+def lire_mesures(mesures, heures=None, animal_id=None, debut_local=None,
+                 fin_local=None, client_id=None):
     """Lit les mesures dans MongoDB, au format attendu par scorer().
 
     Soit les `heures` dernières heures (avant maintenant), soit la plage [debut_local, fin_local)
@@ -113,6 +115,8 @@ def lire_mesures(mesures, heures=None, animal_id=None, debut_local=None, fin_loc
         filtre = {"timestamp": {"$gte": debut}}
     if animal_id:
         filtre["animal_id"] = animal_id
+    if client_id is not None:
+        filtre["client_id"] = client_id
     docs = list(mesures.find(filtre,
                              {"_id": 0, "animal_id": 1, "timestamp": 1, "mi": 1, "steps": 1, "duree_s": 1}))
     if not docs:
@@ -125,18 +129,19 @@ def lire_mesures(mesures, heures=None, animal_id=None, debut_local=None, fin_loc
     return df[[c for c in _COLONNES if c in df.columns]]
 
 
-def calculer_bilan(mesures, heures=None):
+def calculer_bilan(mesures, heures=None, client_id=None):
     """Retourne (animaux, ignores) ; lève FileNotFoundError si le modèle est absent.
 
     heures=None : durée de référence courante (réglage « reference_jours »),
     comptée jusqu'à la dernière mesure disponible."""
     if heures is None:
-        heures = heures_reference_courantes()
+        heures = heures_reference_courantes(client_id)
     bundle = charger_modele()
-    fin = fin_donnees(mesures)
+    fin = fin_donnees(mesures, client_id)
     if fin is None:
         return [], []
-    df = lire_mesures(mesures, debut_local=fin - pd.Timedelta(hours=heures), fin_local=fin + _EPS)
+    df = lire_mesures(mesures, debut_local=fin - pd.Timedelta(hours=heures),
+                      fin_local=fin + _EPS, client_id=client_id)
     if df.empty:
         return [], []
     df = _dates(df)
@@ -166,7 +171,7 @@ def _nb(x, n=2):
 
 
 def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fin=None,
-                        reference_heures=None):
+                        reference_heures=None, client_id=None):
     """Courbe heure par heure d'UN animal, jugée par rapport à une référence FIXE.
 
     Référence : les `reference_heures` qui précèdent la DERNIÈRE MESURE enregistrée (None = durée de
@@ -182,9 +187,9 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
     les profils sur 6 h et les médianes sur 24 h.
     Retourne None si l'animal n'a aucune mesure sur la période affichée."""
     if reference_heures is None:
-        reference_heures = heures_reference_courantes()
+        reference_heures = heures_reference_courantes(client_id)
     bundle = charger_modele()
-    fin_ref = fin_donnees(mesures)
+    fin_ref = fin_donnees(mesures, client_id)
     if fin_ref is None:
         return None
     ref_debut = fin_ref - pd.Timedelta(hours=reference_heures)
@@ -194,16 +199,18 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
         aff_debut, aff_fin = fin_ref - pd.Timedelta(hours=heures), fin_ref + _EPS
 
     # 1) données de la référence (N derniers jours enregistrés)
-    df_ref = _dates(lire_mesures(mesures, animal_id=animal_id,
-                                 debut_local=ref_debut, fin_local=fin_ref + _EPS))
+    df_ref = _dates(lire_mesures(
+        mesures, animal_id=animal_id, debut_local=ref_debut,
+        fin_local=fin_ref + _EPS, client_id=client_id))
 
     # 2) données à afficher : la référence + ce qui est plus ancien si la période le demande.
     #    On ne concatène que si des mesures plus anciennes existent : concaténer avec un
     #    DataFrame vide rendait la colonne « timestamp » de type object (erreur « .dt accessor »).
     df_aff = df_ref.copy()
     if aff_debut < ref_debut:
-        df_old = lire_mesures(mesures, animal_id=animal_id, debut_local=aff_debut,
-                              fin_local=min(ref_debut, aff_fin))
+        df_old = lire_mesures(
+            mesures, animal_id=animal_id, debut_local=aff_debut,
+            fin_local=min(ref_debut, aff_fin), client_id=client_id)
         if not df_old.empty:
             df_aff = pd.concat([_dates(df_old), df_ref], ignore_index=True)
     if df_aff.empty:
@@ -281,28 +288,30 @@ def calculer_historique(mesures, animal_id, heures=HEURES_DEFAUT, debut=None, fi
         "points": points}
 
 
-def creer_router(mesures, appliquer_alerte=None, jours_reference=None):
-    """appliquer_alerte(animal_id, condition, message) : branche le bilan sur le système d'alertes.
+def creer_router(mesures, appliquer_alerte=None, jours_reference=None, courant=None):
+    """appliquer_alerte(animal_id, condition, message, client_id) : branche les alertes.
 
-    jours_reference() : callable sans argument renvoyant la durée de référence en jours
+    jours_reference(client_id) : durée de référence propre au client
     (lue à chaque appel) ; None = 7 jours."""
     global _jours_reference
     _jours_reference = jours_reference
     router = APIRouter(prefix="/ia", tags=["ia"])
 
     @router.get("/bilan")
-    def bilan(heures: Optional[int] = None, enregistrer: bool = False):
+    def bilan(heures: Optional[int] = None, enregistrer: bool = False,
+              utilisateur: dict = Depends(courant)):
         """Animaux dont le comportement est inhabituel sur les 24 dernières heures enregistrées.
 
         `heures` absent = durée de référence courante (réglage « reference_jours »)."""
         if heures is None:
-            heures = heures_reference_courantes()
+            client_id = utilisateur["client_id"]
+            heures = heures_reference_courantes(client_id)
         if heures < HEURES_MIN:
             raise HTTPException(400, f"Il faut au moins {HEURES_MIN} h d'historique (reçu : {heures}).")
         if enregistrer and appliquer_alerte is None:
             raise HTTPException(501, "Enregistrement des alertes non configuré.")
         try:
-            animaux, ignores = calculer_bilan(mesures, heures)
+            animaux, ignores = calculer_bilan(mesures, heures, client_id)
         except FileNotFoundError:
             raise HTTPException(503, "Modèle introuvable : lancer entrainer_modele_final.py d'abord.")
         except ValueError as e:
@@ -317,13 +326,15 @@ def creer_router(mesures, appliquer_alerte=None, jours_reference=None):
             for x in animaux:
                 appliquer_alerte(
                     x["animal_id"], x["statut"] == "a_surveiller",
-                    f"Comportement inhabituel : {x['heures_alerte']} h en alerte sur les dernières 24 h (à vérifier)")
+                    f"Comportement inhabituel : {x['heures_alerte']} h en alerte sur les dernières 24 h (à vérifier)",
+                    utilisateur["client_id"])
         return {"animaux": animaux, "ignores": ignores, "seuil_heures": SEUIL_HEURES_ALERTE,
                 "alertes_mises_a_jour": enregistrer}
 
     @router.get("/historique/{animal_id}")
     def historique(animal_id: str, heures: int = HEURES_DEFAUT,
-                   debut: Optional[str] = None, fin: Optional[str] = None):
+                   debut: Optional[str] = None, fin: Optional[str] = None,
+                   utilisateur: dict = Depends(courant)):
         """Historique d'activité heure par heure d'un animal, avec les heures anormales.
 
         Soit `heures` (dernières heures affichées), soit `debut` et `fin` (dates locales, fin EXCLUE).
@@ -346,7 +357,9 @@ def creer_router(mesures, appliquer_alerte=None, jours_reference=None):
         elif heures < HEURES_MIN or heures > HEURES_MAX:
             raise HTTPException(400, f"heures doit être compris entre {HEURES_MIN} et {HEURES_MAX} (reçu : {heures}).")
         try:
-            res = calculer_historique(mesures, animal_id, heures, d, f)
+            res = calculer_historique(
+                mesures, animal_id, heures, d, f,
+                client_id=utilisateur["client_id"])
         except FileNotFoundError:
             raise HTTPException(503, "Modèle introuvable : lancer entrainer_modele_final.py d'abord.")
         except ValueError as e:

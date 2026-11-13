@@ -13,6 +13,7 @@ from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException,
                      WebSocket, WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
+from bson import ObjectId
 from pymongo import MongoClient
 from pymongo.errors import OperationFailure
 
@@ -21,7 +22,7 @@ from geofence import analyser_point, valider_sommets
 from IA.ia_routes import creer_router, calculer_bilan, SEUIL_HEURES_ALERTE   # AJOUT IA
 from params import BORNES, DEFAUTS, FIXES, valider_parametres
 import trajectoire_service                                   # AJOUT LSTM
-from auth import creer_routeur                               # AJOUT AUTH
+from auth import creer_dependance_courant, creer_routeur     # AJOUT AUTH
 from messagerie import creer_routeur_messagerie
 
 MQTT_HOST = os.getenv("MQTT_HOST", "ycf81881.ala.eu-central-1.emqxsl.com")
@@ -77,28 +78,37 @@ pasture = base["pastures"]
 parametres_col = base["parametres"]
 mesures_activite = base["mesures_activite"]    # AJOUT IA : un document par message (mi, steps, duree_s)
 lstm_evenements = base["lstm_alertes_silencieuses"]   # AJOUT NETTOYAGE
+clients_col = base["clients"]
+courant = creer_dependance_courant(base["utilisateurs"])
 
-_cache_params = {"v": None}
-_cache_zone = {"zone": None, "charge": False}
+_cache_params = {}
+_cache_zone = {}
 
 
-def P() -> dict:
+def P(client_id=None) -> dict:
     """Paramètres actifs (défauts + valeurs enregistrées). reference_jours est fixé à 4.
     Les paramètres de FIXES (ex. marge_pature_m) gardent toujours leur valeur par défaut."""
-    if _cache_params["v"] is None:
-        doc = parametres_col.find_one({"_id": "global"}) or {}
-        _cache_params["v"] = {**DEFAUTS,
-                              **{k: doc[k] for k in DEFAUTS if k in doc and k not in FIXES},
-                              "reference_jours": REFERENCE_JOURS}
-    return _cache_params["v"]
+    cle = str(client_id or "legacy")
+    if cle not in _cache_params:
+        filtre = {"client_id": client_id} if client_id is not None else {"_id": "global"}
+        doc = parametres_col.find_one(filtre) or {}
+        _cache_params[cle] = {
+            **DEFAUTS,
+            **{k: doc[k] for k in DEFAUTS if k in doc and k not in FIXES},
+            "reference_jours": REFERENCE_JOURS,
+        }
+    return _cache_params[cle]
 
 
-def zone_active():
+def zone_active(client_id=None):
     """Zone de pâturage active (mise en cache)."""
-    if not _cache_zone["charge"]:
-        _cache_zone["zone"] = pasture.find_one({"active": True}, {"_id": 0})
-        _cache_zone["charge"] = True
-    return _cache_zone["zone"]
+    cle = str(client_id or "legacy")
+    if cle not in _cache_zone:
+        filtre = {"active": True}
+        if client_id is not None:
+            filtre["client_id"] = client_id
+        _cache_zone[cle] = pasture.find_one(filtre, {"_id": 0})
+    return _cache_zone[cle]
 
 
 # ---------------------------------------------------------------------------
@@ -114,25 +124,33 @@ class Diffuseur:
     """Envoie les événements à tous les clients WebSocket connectés."""
 
     def __init__(self):
-        self.clients: set[WebSocket] = set()
+        self.clients: dict[WebSocket, ObjectId] = {}
         self.boucle = None
 
-    async def _envoyer(self, texte: str):
-        for ws in list(self.clients):
+    async def _envoyer(self, texte: str, client_id):
+        for ws, proprietaire in list(self.clients.items()):
+            if proprietaire != client_id:
+                continue
             try:
                 await ws.send_text(texte)
             except Exception:
-                self.clients.discard(ws)
+                self.clients.pop(ws, None)
 
-    def publier(self, evenement: dict):
+    def publier(self, evenement: dict, client_id):
         """Appelable depuis le thread MQTT."""
         if self.boucle is None or not self.clients:
             return
         texte = json.dumps(evenement, default=_json)
-        asyncio.run_coroutine_threadsafe(self._envoyer(texte), self.boucle)
+        asyncio.run_coroutine_threadsafe(self._envoyer(texte, client_id), self.boucle)
 
 
 diffuseur = Diffuseur()
+
+
+def _client_id(valeur):
+    if isinstance(valeur, ObjectId):
+        return valeur
+    return ObjectId(str(valeur))
 
 
 class Position(BaseModel):
@@ -143,6 +161,9 @@ class Position(BaseModel):
     vitesse: float
     activite: str
     timestamp: datetime
+    numero_client: Optional[str] = None
+    ferme: Optional[str] = None
+    client_id: Optional[str] = None
 
 
 class InfoAnimal(BaseModel):
@@ -151,6 +172,7 @@ class InfoAnimal(BaseModel):
     sexe: Optional[Literal["femelle", "male"]] = None
     age_ans: Optional[float] = Field(None, ge=0, le=40)
     poids_kg: Optional[float] = Field(None, gt=0, le=1500)
+    ferme: str = Field(default="Ferme principale", min_length=1, max_length=80)
 
 
 # ---------------------------------------------------------------------------
@@ -158,8 +180,10 @@ class InfoAnimal(BaseModel):
 # ---------------------------------------------------------------------------
 def gerer_alerte(animal_id, type_alerte, condition, message, position):
     """Ouvre une alerte quand le problème apparaît, la ferme quand il disparaît."""
+    client_id = _client_id(position.client_id)
+    filtre = {"client_id": client_id, "animal_id": animal_id, "type": type_alerte}
     ouverte = alerts.find_one(
-        {"animal_id": animal_id, "type": type_alerte, "resolue": False}
+        {**filtre, "resolue": False}
     )
     if condition and ouverte is None:
         doc = {
@@ -170,13 +194,15 @@ def gerer_alerte(animal_id, type_alerte, condition, message, position):
             "lon": position.lon,
             "timestamp": position.timestamp,
             "resolue": False,
+            "client_id": client_id,
+            "numero_client": position.numero_client,
         }
         alerts.insert_one(dict(doc))
         print(f"ALERTE [{type_alerte}] {animal_id} : {message}")
-        diffuseur.publier({"type": "alerte", "data": doc})
+        diffuseur.publier({"type": "alerte", "data": doc}, client_id)
     elif not condition and ouverte is not None:
         alerts.update_one(
-            {"_id": ouverte["_id"]},
+            {"_id": ouverte["_id"], "client_id": client_id},
             {"$set": {"resolue": True, "resolue_le": position.timestamp}},
         )
         print(f"Alerte résolue [{type_alerte}] {animal_id}")
@@ -184,35 +210,43 @@ def gerer_alerte(animal_id, type_alerte, condition, message, position):
             "animal_id": animal_id,
             "type": type_alerte,
             "resolue_le": position.timestamp,
-        }})
+        }}, client_id)
 
 
-def appliquer_alerte_ia(animal_id, condition, message):
+def appliquer_alerte_ia(animal_id, condition, message, client_id):
     """AJOUT IA : branche le bilan Isolation Forest sur le système d'alertes existant
     (ouverture, résolution automatique, diffusion WebSocket), à la dernière position connue."""
-    doc = positions.find_one({"animal_id": animal_id}, {"_id": 0}, sort=[("timestamp", -1)])
+    client_id = _client_id(client_id)
+    doc = positions.find_one(
+        {"client_id": client_id, "animal_id": animal_id},
+        {"_id": 0}, sort=[("timestamp", -1)])
     if not doc:
         return
     doc["timestamp"] = datetime.now(timezone.utc)
-    gerer_alerte(animal_id, "comportement_inhabituel", condition, message, Position(**doc))
+    gerer_alerte(
+        animal_id, "comportement_inhabituel", condition, message,
+        Position(**{**doc, "client_id": str(client_id)}))
 
 
 def executer_bilan_ia():
     """AJOUT IA AUTO : calcule le bilan des 24 dernières heures pour tous les animaux
     et ouvre / résout les alertes « comportement_inhabituel » (même logique que
     GET /ia/bilan?enregistrer=true). La référence dure reference_jours jours (réglage)."""
-    animaux_ia, ignores = calculer_bilan(mesures_activite, P()["reference_jours"] * 24)
-    for x in animaux_ia:
-        try:
-            appliquer_alerte_ia(
-                x["animal_id"], x["statut"] == "a_surveiller",
-                f"Comportement inhabituel : {x['heures_alerte']} h en alerte sur les "
-                f"dernières 24 h (à vérifier)")
-        except Exception as erreur:
-            print(f"Erreur alerte IA {x['animal_id']} : {erreur}")
-    nb = sum(1 for x in animaux_ia if x["statut"] == "a_surveiller")
-    print(f"Bilan IA : {len(animaux_ia)} animaux analysés, {nb} à surveiller "
-          f"(seuil {SEUIL_HEURES_ALERTE} h), {len(ignores)} ignorés")
+    for client in clients_col.find({}, {"_id": 1, "numero_client": 1}):
+        client_id = client["_id"]
+        animaux_ia, ignores = calculer_bilan(
+            mesures_activite, P(client_id)["reference_jours"] * 24, client_id)
+        for x in animaux_ia:
+            try:
+                appliquer_alerte_ia(
+                    x["animal_id"], x["statut"] == "a_surveiller",
+                    f"Comportement inhabituel : {x['heures_alerte']} h en alerte sur les "
+                    f"dernières 24 h (à vérifier)", client_id)
+            except Exception as erreur:
+                print(f"Erreur alerte IA {x['animal_id']} : {erreur}")
+        nb = sum(1 for x in animaux_ia if x["statut"] == "a_surveiller")
+        print(f"Bilan IA client {client['numero_client']} : {len(animaux_ia)} animaux analysés, "
+              f"{nb} à surveiller (seuil {SEUIL_HEURES_ALERTE} h), {len(ignores)} ignorés")
 
 
 def recalculer_alertes_ia():
@@ -242,20 +276,30 @@ async def surveillance_ia():
         await asyncio.sleep(INTERVALLE_BILAN_IA_S)
 
 
-def appliquer_alerte_lstm(animal_id, condition, message):
+def appliquer_alerte_lstm(animal_id, condition, message, client_id):
     """AJOUT LSTM : branche l'alerte sur le système d'alertes existant (mode actif seulement)."""
-    doc = positions.find_one({"animal_id": animal_id}, {"_id": 0}, sort=[("timestamp", -1)])
+    client_id = _client_id(client_id)
+    doc = positions.find_one(
+        {"client_id": client_id, "animal_id": animal_id},
+        {"_id": 0}, sort=[("timestamp", -1)])
     if not doc:
         return
     doc["timestamp"] = datetime.now(timezone.utc)
-    gerer_alerte(animal_id, "mouvement_agite", condition, message, Position(**doc))
+    gerer_alerte(
+        animal_id, "mouvement_agite", condition, message,
+        Position(**{**doc, "client_id": str(client_id)}))
 
 
 def executer_cycle_lstm():
     """AJOUT LSTM : un cycle d'analyse des trajectoires."""
     seuil = os.getenv("LSTM_SEUIL_M")          # vide = seuil du modèle
-    bilan = trajectoire_service.executer_cycle(
-        base, seuil=float(seuil) if seuil else None)
+    bilan = {"animaux": 0, "alertes": 0}
+    for client in clients_col.find({}, {"_id": 1, "numero_client": 1}):
+        resultat = trajectoire_service.executer_cycle(
+            base, seuil=float(seuil) if seuil else None,
+            client_id=client["_id"])
+        bilan["animaux"] += resultat["animaux"]
+        bilan["alertes"] += resultat["alertes"]
     print(f"Cycle LSTM : {bilan}")
     return bilan
 
@@ -297,9 +341,22 @@ def creer_index_animaux():
     """Un seul document par animal. Un échec (ex. doublons déjà présents dans la
     collection) ne doit pas empêcher le serveur de démarrer."""
     try:
-        animaux.create_index("animal_id", unique=True)
+        indexes = animaux.index_information()
+        if "animal_id_1" in indexes:
+            animaux.drop_index("animal_id_1")
+        animaux.create_index([("client_id", 1), ("animal_id", 1)], unique=True)
     except Exception as erreur:
         print(f"Index animaux non créé : {erreur}")
+
+
+def creer_index_etat_animaux():
+    try:
+        if "animal_id_1" in etat_animaux.index_information():
+            etat_animaux.drop_index("animal_id_1")
+        etat_animaux.create_index(
+            [("client_id", 1), ("animal_id", 1)], unique=True)
+    except Exception as erreur:
+        print(f"Index état animaux non créé : {erreur}")
 
 
 def creer_index_nettoyage():
@@ -315,7 +372,7 @@ def creer_index_nettoyage():
 # ---------------------------------------------------------------------------
 # Nettoyage automatique de la base (AJOUT NETTOYAGE)
 # ---------------------------------------------------------------------------
-def nettoyer_base():
+def nettoyer_base(client_id=None):
     """Supprime les anciennes données pour économiser le stockage.
 
     - alertes de TOUS types, actives ou résolues : supprimées uniquement quand leur
@@ -332,27 +389,32 @@ def nettoyer_base():
 
     # --- Alertes : uniquement celles dont l'âge dépasse DUREE_ALERTES_H ---
     filtre_alertes = {"timestamp": {"$lt": limite_alertes}}
+    filtre_donnees = {}
+    if client_id is not None:
+        client_id = _client_id(client_id)
+        filtre_alertes["client_id"] = client_id
+        filtre_donnees["client_id"] = client_id
 
     # Les alertes encore actives qui vont disparaître sont retirées de l'application.
     # Si le problème persiste, une nouvelle alerte sera créée au prochain contrôle.
     for a in alerts.find({**filtre_alertes, "resolue": False},
-                         {"animal_id": 1, "type": 1}):
+                         {"animal_id": 1, "type": 1, "client_id": 1}):
         diffuseur.publier({"type": "alerte_resolue", "data": {
             "animal_id": a["animal_id"],
             "type": a["type"],
             "resolue_le": maintenant,
-        }})
+        }}, a["client_id"])
     bilan["alertes"] = alerts.delete_many(filtre_alertes).deleted_count
 
     # --- Autres données ---
     bilan["positions"] = positions.delete_many(
-        {"timestamp": {"$lt": limite_donnees}}).deleted_count
+        {**filtre_donnees, "timestamp": {"$lt": limite_donnees}}).deleted_count
     bilan["mesures_activite"] = mesures_activite.delete_many(
-        {"timestamp": {"$lt": limite_donnees}}).deleted_count
+        {**filtre_donnees, "timestamp": {"$lt": limite_donnees}}).deleted_count
     bilan["evenements_lstm"] = lstm_evenements.delete_many(
-        {"cree_le": {"$lt": limite_donnees}}).deleted_count
+        {**filtre_donnees, "cree_le": {"$lt": limite_donnees}}).deleted_count
     bilan["anciennes_zones"] = pasture.delete_many(
-        {"active": False, "cree_le": {"$lt": limite_donnees}}).deleted_count
+        {**filtre_donnees, "active": False, "cree_le": {"$lt": limite_donnees}}).deleted_count
 
     total = sum(bilan.values())
     print(f"Nettoyage : {total} documents supprimés {bilan} "
@@ -374,22 +436,25 @@ async def surveillance_nettoyage():
 # ---------------------------------------------------------------------------
 # Troupeau
 # ---------------------------------------------------------------------------
-def positions_actuelles(reference):
-    limite = reference - timedelta(seconds=P()["fraicheur_s"])
+def positions_actuelles(reference, client_id):
+    client_id = _client_id(client_id)
+    limite = reference - timedelta(seconds=P(client_id)["fraicheur_s"])
     resultat = []
-    for animal_id in positions.distinct("animal_id"):
+    for animal_id in positions.distinct("animal_id", {"client_id": client_id}):
         doc = positions.find_one(
-            {"animal_id": animal_id}, {"_id": 0}, sort=[("timestamp", -1)]
+            {"client_id": client_id, "animal_id": animal_id},
+            {"_id": 0}, sort=[("timestamp", -1)]
         )
         if doc and doc["timestamp"] >= limite:
             resultat.append(doc)
     return resultat
 
 
-def nb_animaux_en_alerte(reference):
-    limite = reference - timedelta(seconds=P()["fraicheur_s"])
+def nb_animaux_en_alerte(reference, client_id):
+    limite = reference - timedelta(seconds=P(client_id)["fraicheur_s"])
     return etat_animaux.count_documents(
-        {"alerte": True, "derniere_mesure": {"$gte": limite}}
+        {"client_id": _client_id(client_id), "alerte": True,
+         "derniere_mesure": {"$gte": limite}}
     )
 
 
@@ -400,31 +465,33 @@ def verifier_troupeau(p, reevaluation=False):
     - pas de diffusion du troupeau ici (faite une seule fois à la fin)
     - la confirmation est immédiate (on juge la dernière position telle quelle)
     """
-    prm = P()
-    actuelles = positions_actuelles(p.timestamp)
+    client_id = _client_id(p.client_id)
+    prm = P(client_id)
+    actuelles = positions_actuelles(p.timestamp, client_id)
     if len(actuelles) < prm["min_animaux_troupeau"]:
         if not reevaluation:
             diffuseur.publier({"type": "troupeau", "data": {
                 "statut": "pas assez d'animaux actifs",
-                "animaux_actifs": len(actuelles)}})
+                "animaux_actifs": len(actuelles)}}, client_id)
         return
     principal, autres, ecarts = analyser_troupeaux(actuelles, prm)
 
     # AJOUT ZONE AUTO : la zone de pâturage automatique suit le grand troupeau
     try:
-        maj_zone_auto(principal)
+        maj_zone_auto(principal, client_id, p.numero_client)
     except Exception as erreur:
         print(f"Erreur maj_zone_auto : {erreur}")
 
     if not reevaluation:
         diffuseur.publier({"type": "troupeau", "data": {
             "statut": "ok", "animaux_actifs": len(actuelles),
-            "grand_troupeau": principal, "autres_groupes": autres}})
+            "grand_troupeau": principal, "autres_groupes": autres}}, client_id)
 
     ecart = ecarts.get(p.animal_id)
     hors = ecart is not None and ecart > prm["distance_alerte_m"]
 
-    etat = etat_animaux.find_one({"animal_id": p.animal_id}) or {}
+    etat = etat_animaux.find_one(
+        {"client_id": client_id, "animal_id": p.animal_id}) or {}
     if reevaluation:
         nb_hors = prm["nb_confirmations"] if hors else 0
     else:
@@ -432,13 +499,14 @@ def verifier_troupeau(p, reevaluation=False):
     alerte = nb_hors >= prm["nb_confirmations"]
 
     etat_animaux.update_one(
-        {"animal_id": p.animal_id},
+        {"client_id": client_id, "animal_id": p.animal_id},
         {"$set": {"nb_hors_zone": nb_hors, "alerte": alerte,
                   "ecart_m": ecart if ecart is not None else 0.0,
-                  "derniere_mesure": p.timestamp}},
+                  "derniere_mesure": p.timestamp,
+                  "numero_client": p.numero_client}},
         upsert=True,
     )
-    total = nb_animaux_en_alerte(p.timestamp)
+    total = nb_animaux_en_alerte(p.timestamp, client_id)
     message = (f"À {round(ecart or 0)} m du grand troupeau "
                f"(confirmé sur {prm['nb_confirmations']} mesures). "
                f"Animaux hors zone : {total}")
@@ -449,12 +517,13 @@ def verifier_troupeau(p, reevaluation=False):
 # Géorepérage
 # ---------------------------------------------------------------------------
 def verifier_pature(p):
-    zone = zone_active()
+    client_id = _client_id(p.client_id)
+    zone = zone_active(client_id)
     if not zone:
         return
     sommets = [(c["latitude"], c["longitude"]) for c in zone["coordinates"]]
     dedans, bord = analyser_point(p.lat, p.lon, sommets)
-    hors = (not dedans) and bord > P()["marge_pature_m"]
+    hors = (not dedans) and bord > P(client_id)["marge_pature_m"]
     gerer_alerte(
         p.animal_id, "hors_pature", hors,
         f"Hors de la zone « {zone['name']} », à {round(bord)} m du bord", p,
@@ -465,14 +534,17 @@ def verifier_pature(p):
 # Alertes individuelles
 # ---------------------------------------------------------------------------
 def verifier_alertes_individuelles(p):
-    prm = P()
+    client_id = _client_id(p.client_id)
+    prm = P(client_id)
     duree = prm["duree_immobilite_s"]
     debut = p.timestamp - timedelta(seconds=duree)
     fenetre = list(positions.find(
-        {"animal_id": p.animal_id, "timestamp": {"$gte": debut, "$lte": p.timestamp}},
+        {"client_id": client_id, "animal_id": p.animal_id,
+         "timestamp": {"$gte": debut, "$lte": p.timestamp}},
         {"_id": 0}).sort("timestamp", 1))
     repere = positions.find_one(
-        {"animal_id": p.animal_id, "timestamp": {"$lt": debut}},
+        {"client_id": client_id, "animal_id": p.animal_id,
+         "timestamp": {"$lt": debut}},
         {"_id": 0}, sort=[("timestamp", -1)])
     if repere:
         fenetre.insert(0, repere)
@@ -482,7 +554,8 @@ def verifier_alertes_individuelles(p):
         f"Au repos depuis plus de {duree // 60} min", p)
 
     nb = prm["nb_mesures_vitesse"]
-    dernieres = list(positions.find({"animal_id": p.animal_id}, {"_id": 0})
+    dernieres = list(positions.find(
+                     {"client_id": client_id, "animal_id": p.animal_id}, {"_id": 0})
                      .sort("timestamp", -1).limit(nb))[::-1]
     gerer_alerte(
         p.animal_id, "deplacement_inhabituel",
@@ -493,19 +566,26 @@ def verifier_alertes_individuelles(p):
 # ---------------------------------------------------------------------------
 # Collier silencieux
 # ---------------------------------------------------------------------------
-def verifier_colliers():
-    delai = P()["delai_collier_s"]
+def verifier_colliers(client_id=None):
     maintenant = datetime.now(timezone.utc)
-    for animal_id in positions.distinct("animal_id"):
+    filtre = {"client_id": _client_id(client_id)} if client_id is not None else {}
+    for animal in animaux.find(
+        filtre, {"animal_id": 1, "client_id": 1, "numero_client": 1, "ferme": 1}):
+        animal_client_id = animal["client_id"]
+        animal_id = animal["animal_id"]
+        delai = P(animal_client_id)["delai_collier_s"]
         doc = positions.find_one(
-            {"animal_id": animal_id}, {"_id": 0}, sort=[("timestamp", -1)])
+            {"client_id": animal_client_id, "animal_id": animal_id},
+            {"_id": 0}, sort=[("timestamp", -1)])
         if not doc:
             continue
         age = (maintenant - doc["timestamp"]).total_seconds()
         doc["timestamp"] = maintenant
         gerer_alerte(animal_id, "collier_silencieux", age > delai,
                      f"Aucun message depuis plus de {delai // 60} min",
-                     Position(**doc))
+                     Position(**{**doc, "client_id": str(animal_client_id),
+                                 "numero_client": animal["numero_client"],
+                                 "ferme": animal.get("ferme")}))
 
 
 async def surveillance_colliers():
@@ -529,7 +609,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
         print(f"Échec de connexion : {reason_code}")
 
 
-def on_message(client, userdata, msg):
+def on_message(mqtt_client_instance, userdata, msg):
     try:
         data = json.loads(msg.payload.decode("utf-8"))
         position = Position(**data)
@@ -540,15 +620,60 @@ def on_message(client, userdata, msg):
     if position.timestamp.tzinfo is None:
         position.timestamp = position.timestamp.replace(tzinfo=timezone.utc)
 
-    positions.insert_one(position.model_dump())
+    if position.numero_client:
+        client_doc = clients_col.find_one({"numero_client": position.numero_client.strip()})
+        if client_doc is None:
+            print(f"Message rejeté : numéro client inconnu ({position.numero_client})")
+            return
+        ferme = (position.ferme or "Ferme principale").strip() or "Ferme principale"
+        animal = animaux.find_one({
+            "client_id": client_doc["_id"],
+            "animal_id": position.animal_id,
+        })
+        if animal is None:
+            animaux.insert_one({
+                "client_id": client_doc["_id"],
+                "numero_client": client_doc["numero_client"],
+                "animal_id": position.animal_id,
+                "ferme": ferme,
+                "cree_le": datetime.now(timezone.utc),
+            })
+        else:
+            ferme = animal.get("ferme") or ferme
+    else:
+        proprietaires = list(animaux.find(
+            {"animal_id": position.animal_id},
+            {"client_id": 1, "numero_client": 1, "ferme": 1},
+        ).limit(2))
+        if len(proprietaires) != 1:
+            print(f"Message rejeté : numéro client manquant ou animal ambigu ({position.animal_id})")
+            return
+        animal = proprietaires[0]
+        client_doc = clients_col.find_one({"_id": animal["client_id"]})
+        if client_doc is None:
+            print(f"Message rejeté : client introuvable pour {position.animal_id}")
+            return
+        ferme = animal.get("ferme", "Ferme principale")
+
+    position = position.model_copy(update={
+        "client_id": str(client_doc["_id"]),
+        "numero_client": client_doc["numero_client"],
+        "ferme": ferme,
+    })
+    document = position.model_dump()
+    document["client_id"] = client_doc["_id"]
+    positions.insert_one(document)
     print(f"Enregistré : {position.animal_id} ({position.lat}, {position.lon})")
-    diffuseur.publier({"type": "position", "data": position.model_dump()})
+    diffuseur.publier({"type": "position",
+                       "data": position.model_dump(exclude={"client_id"})},
+                      client_doc["_id"])
 
     # AJOUT IA : activité du MPU6050 (mi, steps, duree_s) conservée pour le bilan Isolation Forest
     if "mi" in data and "steps" in data:
         try:
             mesures_activite.insert_one({
                 "animal_id": position.animal_id, "timestamp": position.timestamp,
+                "client_id": client_doc["_id"], "numero_client": client_doc["numero_client"],
                 "mi": float(data["mi"]), "steps": float(data["steps"]),
                 "duree_s": float(data["duree_s"]) if data.get("duree_s") is not None else None})
         except Exception as erreur:
@@ -584,7 +709,7 @@ async def lifespan(app: FastAPI):
         positions.create_index, [("animal_id", 1), ("timestamp", -1)]
     )
     await asyncio.to_thread(
-        etat_animaux.create_index, "animal_id", unique=True
+        creer_index_etat_animaux
     )
     await asyncio.to_thread(creer_index_animaux)        # AJOUT FICHES ANIMAUX (sans bloquer le démarrage)
     await asyncio.to_thread(
@@ -621,7 +746,8 @@ app.add_middleware(
 )
 # AJOUT IA : /ia/bilan, /ia/historique ; la durée de référence est lue à chaque appel
 app.include_router(creer_router(mesures_activite, appliquer_alerte_ia,
-                                lambda: P()["reference_jours"]))
+                                lambda client_id: P(client_id)["reference_jours"],
+                                courant))
 # AJOUT AUTH : /auth/etat, /auth/inscription, /auth/connexion, /auth/moi, /utilisateurs
 app.include_router(creer_routeur(base))
 app.include_router(creer_routeur_messagerie(base))
@@ -636,7 +762,7 @@ app.include_router(creer_routeur_messagerie(base))
 # ---------------------------------------------------------------------------
 INTERVALLE_MAJ_ZONE_S = 30          # recalcul périodique de la zone
 TOLERANCE_REDUCTION_M = 10          # la zone ne rétrécit pas pour moins de 10 m
-_maj_zone = {"t": 0.0}
+_maj_zone = {}
 
 
 def _zone_publique(zone):
@@ -645,12 +771,12 @@ def _zone_publique(zone):
             "mode": zone.get("mode", "manuel"), "marge_m": zone.get("marge_m")}
 
 
-def _demi_cote_m(principal):
+def _demi_cote_m(principal, client_id):
     """Demi-côté du carré : rayon du troupeau + moitié de distance_alerte_m."""
     n = max(int(principal.get("nb_animaux", 1)), 1)
     rayon_estime = math.sqrt(n * SURFACE_PAR_ANIMAL_M2 / math.pi)
     rayon = max(rayon_estime, float(principal.get("rayon_m", 0.0)))
-    return rayon + P()["distance_alerte_m"] / 2
+    return rayon + P(client_id)["distance_alerte_m"] / 2
 
 
 def _rectangle(clat, clon, demi_cote_m):
@@ -666,54 +792,68 @@ def _demi_cote_actuel(zone):
     return math.radians(max(lats) - min(lats)) * RAYON_TERRE_M / 2
 
 
-def _grand_troupeau():
+def _grand_troupeau(client_id):
     """Zone (centre, rayon, nb_animaux) du grand troupeau actuel, ou None."""
-    derniere = positions.find_one({}, {"_id": 0}, sort=[("timestamp", -1)])
+    client_id = _client_id(client_id)
+    derniere = positions.find_one(
+        {"client_id": client_id}, {"_id": 0, "client_id": 0},
+        sort=[("timestamp", -1)])
     if not derniere:
         return None
-    actuelles = positions_actuelles(derniere["timestamp"])
-    if len(actuelles) < P()["min_animaux_troupeau"]:
+    actuelles = positions_actuelles(derniere["timestamp"], client_id)
+    if len(actuelles) < P(client_id)["min_animaux_troupeau"]:
         return None
-    return analyser_troupeaux(actuelles, P())[0]
+    return analyser_troupeaux(actuelles, P(client_id))[0]
 
 
-def _sommets_auto():
-    principal = _grand_troupeau()
+def _sommets_auto(client_id):
+    principal = _grand_troupeau(client_id)
     if principal is None:
         raise ValueError("Pas assez d'animaux actifs pour calculer la zone automatique.")
     return _rectangle(principal["centre_lat"], principal["centre_lon"],
-                      _demi_cote_m(principal))
+                      _demi_cote_m(principal, client_id))
 
 
-def _reverifier_pature_tous():
-    for animal_id in positions.distinct("animal_id"):
-        d = positions.find_one({"animal_id": animal_id}, sort=[("timestamp", -1)])
+def _reverifier_pature_tous(client_id):
+    client_id = _client_id(client_id)
+    for animal_id in positions.distinct("animal_id", {"client_id": client_id}):
+        d = positions.find_one(
+            {"client_id": client_id, "animal_id": animal_id},
+            sort=[("timestamp", -1)])
         if d:
             try:
-                verifier_pature(Position(**{k: d[k] for k in Position.model_fields}))
+                verifier_pature(Position(**{
+                    **{k: d[k] for k in Position.model_fields if k in d},
+                    "client_id": str(client_id),
+                }))
             except Exception as e:
                 print(f"Vérification pâturage ignorée : {e}")
 
 
-def _poser_zone(nom, sommets, mode):
+def _poser_zone(client_id, numero_client, nom, sommets, mode):
     """Remplace la zone active et prévient les clients."""
+    client_id = _client_id(client_id)
+    cle = str(client_id)
     zone = {
         "name": nom,
         "coordinates": [{"latitude": a, "longitude": b} for a, b in sommets],
         "cree_le": datetime.now(timezone.utc),
         "active": True,
         "mode": mode,
-        "marge_m": P()["distance_alerte_m"] if mode == "auto" else None,
+        "marge_m": P(client_id)["distance_alerte_m"] if mode == "auto" else None,
+        "client_id": client_id,
+        "numero_client": numero_client,
     }
-    pasture.update_many({"active": True}, {"$set": {"active": False}})
+    pasture.update_many({"client_id": client_id, "active": True},
+                        {"$set": {"active": False}})
     pasture.insert_one(dict(zone))
-    _cache_zone["zone"], _cache_zone["charge"] = zone, True
-    _maj_zone["t"] = time.monotonic()
-    diffuseur.publier({"type": "pature", "data": _zone_publique(zone)})
+    _cache_zone[cle] = zone
+    _maj_zone[cle] = time.monotonic()
+    diffuseur.publier({"type": "pature", "data": _zone_publique(zone)}, client_id)
     return zone
 
 
-def maj_zone_auto(principal, forcer=False):
+def maj_zone_auto(principal, client_id, numero_client, forcer=False):
     """Appelée depuis verifier_troupeau (au plus toutes les 30 s) et, avec
     forcer=True, immédiatement après un changement de réglages.
     - aucune zone : en crée une automatique ;
@@ -721,36 +861,39 @@ def maj_zone_auto(principal, forcer=False):
     Une zone manuelle (administrateur) n'est jamais touchée."""
     if not principal:
         return
-    if not forcer and time.monotonic() - _maj_zone["t"] < INTERVALLE_MAJ_ZONE_S:
+    client_id = _client_id(client_id)
+    cle = str(client_id)
+    if not forcer and time.monotonic() - _maj_zone.get(cle, 0) < INTERVALLE_MAJ_ZONE_S:
         return
-    zone = zone_active()
-    demi = _demi_cote_m(principal)
+    zone = zone_active(client_id)
+    demi = _demi_cote_m(principal, client_id)
     if not zone:
         if ZONE_AUTO:
             sommets = _rectangle(principal["centre_lat"], principal["centre_lon"], demi)
-            _poser_zone("Zone de pâturage", sommets, "auto")
-            _reverifier_pature_tous()
+            _poser_zone(client_id, numero_client, "Zone de pâturage", sommets, "auto")
+            _reverifier_pature_tous(client_id)
         return
     if zone.get("mode") != "auto":
         return
-    _maj_zone["t"] = time.monotonic()
+    _maj_zone[cle] = time.monotonic()
     ancien = _demi_cote_actuel(zone)
     if not forcer and demi < ancien and ancien - demi < TOLERANCE_REDUCTION_M:
         demi = ancien                       # évite que la zone « respire »
     sommets = _rectangle(principal["centre_lat"], principal["centre_lon"], demi)
     coords = [{"latitude": a, "longitude": b} for a, b in sommets]
-    marge = P()["distance_alerte_m"]
-    pasture.update_one({"active": True},
+    marge = P(client_id)["distance_alerte_m"]
+    pasture.update_one({"client_id": client_id, "active": True},
                        {"$set": {"coordinates": coords, "marge_m": marge}})
     zone = {**zone, "coordinates": coords, "marge_m": marge}
-    _cache_zone["zone"] = zone
-    diffuseur.publier({"type": "pature", "data": _zone_publique(zone)})
+    _cache_zone[cle] = zone
+    diffuseur.publier({"type": "pature", "data": _zone_publique(zone)}, client_id)
 
 
-def recalculer_zone_auto():
+def recalculer_zone_auto(client_id, numero_client):
     """Recalcul immédiat (changement de distance_alerte_m ou d'autres réglages)."""
     try:
-        maj_zone_auto(_grand_troupeau(), forcer=True)
+        maj_zone_auto(
+            _grand_troupeau(client_id), client_id, numero_client, forcer=True)
     except Exception as e:
         print(f"Erreur recalcul zone : {e}")
 
@@ -764,22 +907,24 @@ def exiger_admin(x_admin_key: Optional[str] = Header(None)):
 
 
 @app.post("/pastures", dependencies=[Depends(exiger_admin)])
-def creer_pature(donnees: dict):
+def creer_pature(donnees: dict, u: dict = Depends(courant)):
     """Administrateur. {"mode":"auto"} ou {"coordinates":[{"latitude":..,"longitude":..}, ...]}"""
     mode = "auto" if donnees.get("mode") == "auto" else "manuel"
     try:
-        sommets = _sommets_auto() if mode == "auto" else valider_sommets(donnees.get("coordinates"))
+        sommets = (_sommets_auto(u["client_id"]) if mode == "auto"
+                   else valider_sommets(donnees.get("coordinates")))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
-    _poser_zone(str(donnees.get("name") or "Zone de pâturage")[:80], sommets, mode)
-    _reverifier_pature_tous()
+    _poser_zone(u["client_id"], u["numero_client"],
+                str(donnees.get("name") or "Zone de pâturage")[:80], sommets, mode)
+    _reverifier_pature_tous(u["client_id"])
     return {"statut": "ok", "mode": mode, "sommets": len(sommets)}
 
 
 @app.put("/pastures", dependencies=[Depends(exiger_admin)])
-def modifier_pature(donnees: dict):
+def modifier_pature(donnees: dict, u: dict = Depends(courant)):
     """Administrateur. {"mode":"auto"} | {"mode":"manuel"} (fige) | {"coordinates":[...]}"""
-    actuelle = zone_active()
+    actuelle = zone_active(u["client_id"])
     if not actuelle:
         raise HTTPException(status_code=404, detail="Aucune zone enregistrée.")
     if "coordinates" in donnees:
@@ -788,116 +933,140 @@ def modifier_pature(donnees: dict):
         mode = "auto" if donnees.get("mode", actuelle.get("mode")) == "auto" else "manuel"
     try:
         if mode == "auto":
-            sommets = _sommets_auto()
+            sommets = _sommets_auto(u["client_id"])
         elif "coordinates" in donnees:
             sommets = valider_sommets(donnees["coordinates"])
         else:
             sommets = [(c["latitude"], c["longitude"]) for c in actuelle["coordinates"]]
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
-    _poser_zone(str(donnees.get("name") or actuelle["name"])[:80], sommets, mode)
-    _reverifier_pature_tous()
+    _poser_zone(u["client_id"], u["numero_client"],
+                str(donnees.get("name") or actuelle["name"])[:80], sommets, mode)
+    _reverifier_pature_tous(u["client_id"])
     return {"statut": "ok", "mode": mode, "sommets": len(sommets)}
 
 
 @app.get("/pastures")
-def lire_pature():
-    zone = zone_active()
+def lire_pature(u: dict = Depends(courant)):
+    zone = zone_active(u["client_id"])
     if not zone:
         return {"statut": "aucune zone"}
     return _zone_publique(zone)
 
 
 @app.delete("/pastures", dependencies=[Depends(exiger_admin)])
-def supprimer_pature():
+def supprimer_pature(u: dict = Depends(courant)):
     """Désactive la zone, résout les alertes hors_pature, prévient les clients."""
-    pasture.update_many({"active": True}, {"$set": {"active": False}})
-    _cache_zone["zone"], _cache_zone["charge"] = None, True
+    client_id = u["client_id"]
+    pasture.update_many({"client_id": client_id, "active": True},
+                        {"$set": {"active": False}})
+    _cache_zone[str(client_id)] = None
 
     maintenant = datetime.now(timezone.utc)
     nb_resolues = 0
-    for a in list(alerts.find({"type": "hors_pature", "resolue": False})):
+    for a in list(alerts.find({
+        "client_id": client_id, "type": "hors_pature", "resolue": False,
+    })):
         alerts.update_one(
-            {"_id": a["_id"]},
+            {"_id": a["_id"], "client_id": client_id},
             {"$set": {"resolue": True, "resolue_le": maintenant}},
         )
         diffuseur.publier({"type": "alerte_resolue", "data": {
             "animal_id": a["animal_id"],
             "type": "hors_pature",
             "resolue_le": maintenant,
-        }})
+        }}, client_id)
         nb_resolues += 1
 
-    diffuseur.publier({"type": "pature", "data": None})
+    diffuseur.publier({"type": "pature", "data": None}, client_id)
     return {"statut": "ok", "alertes_resolues": nb_resolues}
 
 
 @app.get("/positions")
-def lire_positions(animal_id: Optional[str] = None, limite: int = 50):
-    filtre = {"animal_id": animal_id} if animal_id else {}
-    return list(positions.find(filtre, {"_id": 0}).sort("timestamp", -1).limit(limite))
+def lire_positions(animal_id: Optional[str] = None, limite: int = 50,
+                   u: dict = Depends(courant)):
+    filtre = {"client_id": u["client_id"]}
+    if animal_id:
+        filtre["animal_id"] = animal_id
+    return list(positions.find(
+        filtre, {"_id": 0, "client_id": 0}).sort("timestamp", -1).limit(limite))
 
 
 @app.get("/alertes")
-def lire_alertes(animal_id: Optional[str] = None, actives: bool = False, limite: int = 50):
-    filtre = {}
+def lire_alertes(animal_id: Optional[str] = None, actives: bool = False, limite: int = 50,
+                 u: dict = Depends(courant)):
+    filtre = {"client_id": u["client_id"]}
     if animal_id:
         filtre["animal_id"] = animal_id
     if actives:
         filtre["resolue"] = False
-    return list(alerts.find(filtre, {"_id": 0}).sort("timestamp", -1).limit(limite))
+    return list(alerts.find(
+        filtre, {"_id": 0, "client_id": 0}).sort("timestamp", -1).limit(limite))
 
 
 @app.get("/lstm/evenements")
-def lire_evenements_lstm(animal_id: Optional[str] = None, limite: int = 50):
-    filtre = {"animal_id": animal_id} if animal_id else {}
-    return list(base["lstm_alertes_silencieuses"].find(filtre, {"_id": 0})
+def lire_evenements_lstm(animal_id: Optional[str] = None, limite: int = 50,
+                         u: dict = Depends(courant)):
+    filtre = {"client_id": u["client_id"]}
+    if animal_id:
+        filtre["animal_id"] = animal_id
+    return list(base["lstm_alertes_silencieuses"].find(
+        filtre, {"_id": 0, "client_id": 0})
                 .sort("cree_le", -1).limit(limite))
 
 
 # AJOUT NETTOYAGE : lancer le nettoyage à la demande (administrateur, en-tête X-Admin-Key)
 @app.post("/nettoyage", dependencies=[Depends(exiger_admin)])
-def lancer_nettoyage():
+def lancer_nettoyage(u: dict = Depends(courant)):
     """Exécute nettoyer_base() immédiatement et renvoie le nombre de documents
     supprimés par collection."""
-    return nettoyer_base()
+    return nettoyer_base(u["client_id"])
 
 
 # ---------------------------------------------------------------------------
 # Fiches des animaux (type, sexe, âge, poids)
 # ---------------------------------------------------------------------------
 @app.get("/animaux")
-def lire_animaux():
+def lire_animaux(u: dict = Depends(courant)):
     """Liste des fiches enregistrées (utilisée par la page « Mon troupeau »)."""
-    return list(animaux.find({}, {"_id": 0, "modifie_le": 0}))
+    return list(animaux.find(
+        {"client_id": u["client_id"]},
+        {"_id": 0, "modifie_le": 0, "client_id": 0},
+    ))
 
 
 @app.put("/animaux/{animal_id}")
-def enregistrer_animal(animal_id: str, info: InfoAnimal):
+def enregistrer_animal(animal_id: str, info: InfoAnimal,
+                       u: dict = Depends(courant)):
     """Crée ou met à jour la fiche d'un animal."""
     fiche = info.model_dump()
     animaux.update_one(
-        {"animal_id": animal_id},
-        {"$set": {**fiche, "modifie_le": datetime.now(timezone.utc)}},
+        {"client_id": u["client_id"], "animal_id": animal_id},
+        {"$set": {**fiche, "numero_client": u["numero_client"],
+                  "modifie_le": datetime.now(timezone.utc)},
+         "$setOnInsert": {"client_id": u["client_id"], "animal_id": animal_id}},
         upsert=True,
     )
-    return {"animal_id": animal_id, **fiche}
+    return {"animal_id": animal_id, **fiche, "numero_client": u["numero_client"]}
 
 
 @app.get("/troupeau")
-def etat_troupeau():
-    prm = P()
-    derniere = positions.find_one({}, {"_id": 0}, sort=[("timestamp", -1)])
+def etat_troupeau(u: dict = Depends(courant)):
+    client_id = u["client_id"]
+    prm = P(client_id)
+    derniere = positions.find_one(
+        {"client_id": client_id}, {"_id": 0}, sort=[("timestamp", -1)])
     if not derniere:
         return {"statut": "aucune donnée"}
     reference = derniere["timestamp"]
-    actuelles = positions_actuelles(reference)
+    actuelles = positions_actuelles(reference, client_id)
     if len(actuelles) < prm["min_animaux_troupeau"]:
         return {"statut": "pas assez d'animaux actifs", "animaux_actifs": len(actuelles)}
     principal, autres, _ = analyser_troupeaux(actuelles, prm)
     limite = reference - timedelta(seconds=prm["fraicheur_s"])
     en_alerte = list(etat_animaux.find(
-        {"alerte": True, "derniere_mesure": {"$gte": limite}},
+        {"client_id": client_id, "alerte": True,
+         "derniere_mesure": {"$gte": limite}},
         {"_id": 0, "animal_id": 1, "ecart_m": 1},
     ))
     return {
@@ -910,25 +1079,31 @@ def etat_troupeau():
     }
 
 
-def rediffuser_troupeau():
+def rediffuser_troupeau(u):
     """Recalcule le troupeau avec les paramètres actuels et prévient les clients."""
     try:
-        diffuseur.publier({"type": "troupeau", "data": etat_troupeau()})
+        diffuseur.publier({"type": "troupeau", "data": etat_troupeau(u)}, u["client_id"])
     except Exception as e:
         print(f"Rediffusion troupeau ignorée : {e}")
 
 
-def reevaluer_tous():
+def reevaluer_tous(client_id, numero_client):
     """AJOUT : rejoue toutes les vérifications sur la dernière position de
     chaque animal avec les nouveaux paramètres, sans attendre le prochain
     message MQTT. Alertes ouvertes/fermées et diffusées immédiatement."""
-    recalculer_zone_auto()   # AJOUT ZONE AUTO : la zone suit distance_alerte_m tout de suite
-    for animal_id in positions.distinct("animal_id"):
-        d = positions.find_one({"animal_id": animal_id}, sort=[("timestamp", -1)])
+    recalculer_zone_auto(client_id, numero_client)
+    client_id = _client_id(client_id)
+    for animal_id in positions.distinct("animal_id", {"client_id": client_id}):
+        d = positions.find_one(
+            {"client_id": client_id, "animal_id": animal_id},
+            sort=[("timestamp", -1)])
         if not d:
             continue
         try:
-            p = Position(**{k: d[k] for k in Position.model_fields})
+            p = Position(**{
+                **{k: d[k] for k in Position.model_fields if k in d},
+                "client_id": str(client_id),
+            })
         except Exception as e:
             print(f"Réévaluation ignorée ({animal_id}) : {e}")
             continue
@@ -942,53 +1117,65 @@ def reevaluer_tous():
             except Exception as e:
                 print(f"Erreur {verification.__name__} : {e}")
     try:
-        verifier_colliers()
+        verifier_colliers(client_id)
     except Exception as e:
         print(f"Erreur verifier_colliers : {e}")
-    rediffuser_troupeau()   # une seule diffusion, après les alertes
+    utilisateur = {"client_id": client_id}
+    rediffuser_troupeau(utilisateur)
 
 
 @app.get("/parametres")
-def lire_parametres():
-    return {"valeurs": P(), "defauts": DEFAUTS,
+def lire_parametres(u: dict = Depends(courant)):
+    return {"valeurs": P(u["client_id"]), "defauts": DEFAUTS,
             "bornes": {k: [b[0], b[1]] for k, b in BORNES.items()}}
 
 
 @app.put("/parametres")
-def modifier_parametres(donnees: dict, taches: BackgroundTasks):
+def modifier_parametres(donnees: dict, taches: BackgroundTasks,
+                        u: dict = Depends(courant)):
     try:
         propres = valider_parametres(donnees)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     propres["reference_jours"] = REFERENCE_JOURS
-    ancienne_reference = P()["reference_jours"]
-    nouveaux = {**P(), **propres}
-    parametres_col.update_one({"_id": "global"}, {"$set": nouveaux}, upsert=True)
-    _cache_params["v"] = nouveaux
-    taches.add_task(reevaluer_tous)            # MODIFIÉ : après la réponse
+    client_id = u["client_id"]
+    ancienne_reference = P(client_id)["reference_jours"]
+    nouveaux = {**P(client_id), **propres}
+    parametres_col.update_one(
+        {"client_id": client_id},
+        {"$set": {**nouveaux, "numero_client": u["numero_client"]},
+         "$setOnInsert": {"client_id": client_id}},
+        upsert=True,
+    )
+    _cache_params[str(client_id)] = nouveaux
+    taches.add_task(reevaluer_tous, client_id, u["numero_client"])
     if nouveaux["reference_jours"] != ancienne_reference:
         taches.add_task(recalculer_alertes_ia)  # AJOUT : alertes IA recalculées tout de suite
     return {"statut": "ok", "valeurs": nouveaux}
 
 
-def etat_complet() -> dict:
+def etat_complet(u: dict) -> dict:
     """Photo de départ envoyée à chaque nouveau client WebSocket."""
     dernieres = []
-    for animal_id in positions.distinct("animal_id"):
+    client_id = u["client_id"]
+    for animal_id in positions.distinct("animal_id", {"client_id": client_id}):
         doc = positions.find_one(
-            {"animal_id": animal_id}, {"_id": 0}, sort=[("timestamp", -1)]
+            {"client_id": client_id, "animal_id": animal_id},
+            {"_id": 0, "client_id": 0}, sort=[("timestamp", -1)]
         )
         if doc:
             dernieres.append(doc)
     actives = list(
-        alerts.find({"resolue": False}, {"_id": 0}).sort("timestamp", -1).limit(100)
+        alerts.find({"client_id": client_id, "resolue": False},
+                    {"_id": 0, "client_id": 0})
+        .sort("timestamp", -1).limit(100)
     )
-    zone = zone_active()
+    zone = zone_active(client_id)
     return {
         "type": "etat",
         "positions": dernieres,
         "alertes_actives": actives,
-        "troupeau": etat_troupeau(),
+        "troupeau": etat_troupeau(u),
         "pature": _zone_publique(zone) if zone else None,   # MODIFIÉ : mode + marge
     }
 
@@ -997,15 +1184,27 @@ def etat_complet() -> dict:
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     try:
-        etat = await asyncio.to_thread(etat_complet)
+        identifiants = await ws.receive_json()
+    except (WebSocketDisconnect, json.JSONDecodeError):
+        return
+    if not isinstance(identifiants, dict) or not isinstance(identifiants.get("token"), str):
+        await ws.close(code=4401)
+        return
+    try:
+        u = courant(authorization=f"Bearer {identifiants['token']}")
+    except HTTPException:
+        await ws.close(code=4401)
+        return
+    try:
+        etat = await asyncio.to_thread(etat_complet, u)
         await ws.send_text(json.dumps(etat, default=_json))
-        diffuseur.clients.add(ws)
+        diffuseur.clients[ws] = u["client_id"]
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
         pass
     finally:
-        diffuseur.clients.discard(ws)
+        diffuseur.clients.pop(ws, None)
         
         
 # À COLLER dans main.py, juste après la route /lstm/evenements (lire_evenements_lstm).
@@ -1015,7 +1214,8 @@ async def ws_endpoint(ws: WebSocket):
 
 @app.get("/lstm/trajectoire")
 def lire_trajectoire_lstm(animal_id: str, instant_local: str,
-                          avant_min: int = 90, apres_min: int = 15):
+                          avant_min: int = 90, apres_min: int = 15,
+                          u: dict = Depends(courant)):
     """Positions de l'animal autour d'une alerte (heures renvoyées en heure locale, sans fuseau)."""
     tz = trajectoire_service.TZ_LOCAL
     try:
@@ -1024,7 +1224,7 @@ def lire_trajectoire_lstm(animal_id: str, instant_local: str,
         raise HTTPException(status_code=422, detail="instant_local invalide")
     centre = local.replace(tzinfo=tz).astimezone(timezone.utc)
     docs = positions.find(
-        {"animal_id": animal_id,
+        {"client_id": u["client_id"], "animal_id": animal_id,
          "timestamp": {"$gte": centre - timedelta(minutes=avant_min),
                        "$lte": centre + timedelta(minutes=apres_min)}},
         {"_id": 0, "timestamp": 1, "lat": 1, "lon": 1},
