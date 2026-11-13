@@ -1,5 +1,7 @@
 """Authentification et isolation des comptes clients (FastAPI + MongoDB)."""
 import hashlib
+import base64
+import io
 import os
 import re
 import secrets
@@ -9,10 +11,13 @@ from typing import Literal, Optional
 import bcrypt
 import jwt
 from bson import ObjectId
+import qrcode
 from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
+from qrcode.image.svg import SvgPathImage
 
 SECRET = os.environ["JWT_SECRET"]
 DUREE_H = int(os.getenv("JWT_DUREE_H", "12"))
@@ -30,7 +35,6 @@ class NouveauClient(BaseModel):
     code_activation: str = Field(min_length=8, max_length=128)
     nom: str = Field(min_length=2, max_length=60)
     mot_de_passe: str = Field(min_length=8, max_length=72)
-    appareil_biometrique: str = Field(min_length=16, max_length=128)
     ferme: str = Field(min_length=1, max_length=80)
 
 
@@ -211,12 +215,86 @@ def creer_routeur(db) -> APIRouter:
             raise HTTPException(403, "Clé d’administration invalide.")
 
         code = secrets.token_urlsafe(24)
+        qr = qrcode.QRCode(
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=8,
+            border=4,
+        )
+        qr.add_data(code)
+        qr.make(fit=True)
+        image = qr.make_image(image_factory=SvgPathImage)
+        contenu = io.BytesIO()
+        image.save(contenu)
         codes.insert_one({
             "code_hash": _hachage_code(code),
             "cree_le": datetime.now(timezone.utc),
             "expire_le": datetime.now(timezone.utc) + timedelta(days=corps.duree_jours),
         })
-        return {"code_activation": code, "expire_dans_jours": corps.duree_jours}
+        return {
+            "code_activation": code,
+            "expire_dans_jours": corps.duree_jours,
+            "qr_svg_base64": base64.b64encode(contenu.getvalue()).decode("ascii"),
+        }
+
+    @router.get("/admin/codes-activation", response_class=HTMLResponse)
+    def page_codes_activation():
+        return HTMLResponse(
+            content="""<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>QR d’inscription — Traceur</title>
+<style>
+body{font:16px system-ui,sans-serif;max-width:560px;margin:40px auto;padding:0 18px;color:#18352c}
+main{padding:24px;border:1px solid #dfe8e2;border-radius:20px}
+label{display:block;margin:16px 0 6px;font-weight:600}
+input,button{box-sizing:border-box;width:100%;padding:12px;border:1px solid #bdcbc2;border-radius:10px;font:inherit}
+button{margin-top:20px;background:#23845b;color:white;border:0;font-weight:700}
+#result{text-align:center;margin-top:24px;overflow-wrap:anywhere}
+#qr{width:min(100%,320px);background:white;padding:12px}
+[hidden]{display:none!important}.error{color:#a3212a}
+</style></head><body><main>
+<h1>Créer un QR d’inscription</h1>
+<p>Le code est à usage unique et expire après la durée choisie. Ne partagez le QR qu’avec le nouveau client.</p>
+<form id="form">
+<label for="key">Clé d’administration</label>
+<input id="key" type="password" autocomplete="off" required>
+<label for="days">Expiration (jours)</label>
+<input id="days" type="number" min="1" max="365" value="1" required>
+<button id="submit" type="submit">Générer le QR</button>
+</form>
+<section id="result" hidden><img id="qr" alt="QR code d’inscription">
+<p id="expiry"></p><p id="code"></p></section>
+<p id="error" class="error" role="alert"></p>
+</main><script>
+const form=document.getElementById('form'),key=document.getElementById('key');
+const days=document.getElementById('days'),button=document.getElementById('submit');
+const result=document.getElementById('result'),error=document.getElementById('error');
+form.addEventListener('submit',async event=>{
+ event.preventDefault(); error.textContent=''; result.hidden=true; button.disabled=true;
+ try {
+  const response=await fetch('/auth/codes-activation',{method:'POST',
+   headers:{'Content-Type':'application/json','X-Enrollment-Admin-Key':key.value},
+   body:JSON.stringify({duree_jours:Number(days.value)})});
+  const data=await response.json();
+  if(!response.ok) throw new Error(data.detail||'Impossible de générer le QR.');
+  document.getElementById('qr').src='data:image/svg+xml;base64,'+data.qr_svg_base64;
+  document.getElementById('expiry').textContent='Valide '+data.expire_dans_jours+' jour(s), une seule utilisation.';
+  document.getElementById('code').textContent='Code de secours : '+data.code_activation;
+  result.hidden=false; key.value='';
+ } catch (e) { error.textContent=e.message; }
+ finally { button.disabled=false; }
+});
+</script></body></html>""",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": (
+                    "default-src 'none'; script-src 'unsafe-inline'; "
+                    "style-src 'unsafe-inline'; connect-src 'self'; img-src data:; "
+                    "form-action 'none'; base-uri 'none'"
+                ),
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     @router.post("/auth/nouveau-client", status_code=201)
     def nouveau_client(corps: NouveauClient):
@@ -251,7 +329,6 @@ def creer_routeur(db) -> APIRouter:
             "est_superadmin": True,
             "client_id": client_id,
             "numero_client": numero,
-            "appareils_biometriques": [corps.appareil_biometrique],
             "mot_de_passe": _hacher(corps.mot_de_passe),
             "cree_le": maintenant,
         }

@@ -1,5 +1,7 @@
 import os
 import unittest
+import base64
+import hashlib
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -12,6 +14,8 @@ from pydantic import ValidationError
 
 from auth import (
     Connexion,
+    NouveauClient,
+    NouveauCodeActivation,
     SECRET,
     _hacher,
     _migrer_client_existant,
@@ -109,6 +113,51 @@ class IsolationClientTests(unittest.TestCase):
             Connexion(**donnees, numero_client="01234567").numero_client,
             "01234567",
         )
+
+    def test_code_activation_est_unique_et_renvoie_un_qr_sans_secret_stocke(self):
+        base = BaseMemoire()
+        routeur = creer_routeur(base)
+        creer_code = _route(routeur, "/auth/codes-activation", "POST")
+        page = _route(routeur, "/admin/codes-activation", "GET")()
+        self.assertEqual(page.headers["cache-control"], "no-store")
+        precedent = os.environ.get("CLIENT_ENROLLMENT_ADMIN_KEY")
+        os.environ["CLIENT_ENROLLMENT_ADMIN_KEY"] = "cle-admin-test"
+        try:
+            with self.assertRaises(HTTPException) as erreur:
+                creer_code(
+                    NouveauCodeActivation(duree_jours=1),
+                    cle="mauvaise-cle",
+                )
+            self.assertEqual(erreur.exception.status_code, 403)
+            resultat = creer_code(
+                NouveauCodeActivation(duree_jours=1),
+                cle="cle-admin-test",
+            )
+        finally:
+            if precedent is None:
+                os.environ.pop("CLIENT_ENROLLMENT_ADMIN_KEY", None)
+            else:
+                os.environ["CLIENT_ENROLLMENT_ADMIN_KEY"] = precedent
+
+        self.assertEqual(resultat["expire_dans_jours"], 1)
+        self.assertEqual(len(base["codes_activation"].documents), 1)
+        code_stocke = base["codes_activation"].documents[0]
+        self.assertNotIn("code_activation", code_stocke)
+        self.assertEqual(
+            code_stocke["code_hash"],
+            hashlib.sha256(resultat["code_activation"].encode()).hexdigest(),
+        )
+        qr_svg = base64.b64decode(resultat["qr_svg_base64"])
+        self.assertIn(b"<svg", qr_svg)
+
+    def test_nouveau_client_ne_demande_plus_de_donnee_biometrique(self):
+        client = NouveauClient(
+            code_activation="code-de-test",
+            nom="Admin",
+            mot_de_passe="mot-de-passe",
+            ferme="Ferme principale",
+        )
+        self.assertNotIn("appareil_biometrique", client.model_dump())
 
     def test_migration_rattache_les_donnees_au_client_historique(self):
         base = BaseMemoire()
