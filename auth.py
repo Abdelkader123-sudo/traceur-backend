@@ -70,6 +70,22 @@ def _public(u: dict) -> dict:
     }
 
 
+def creer_dependance_courant(users):
+    def courant(authorization: Optional[str] = Header(None)) -> dict:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(401, "Connexion requise.")
+        try:
+            data = jwt.decode(authorization[7:], SECRET, algorithms=["HS256"])
+            u = users.find_one({"_id": ObjectId(data["sub"])})
+        except Exception:
+            raise HTTPException(401, "Session invalide ou expirée.")
+        if not u:
+            raise HTTPException(401, "Compte introuvable.")
+        return u
+
+    return courant
+
+
 def creer_routeur(db) -> APIRouter:
     users = db["utilisateurs"]
     users.create_index([("nom_cle", 1), ("prenom_cle", 1)], unique=True)
@@ -82,18 +98,7 @@ def creer_routeur(db) -> APIRouter:
 
     router = APIRouter(tags=["auth"])
     mdp_factice = _hacher("factice-pour-temps-constant")
-
-    def courant(authorization: Optional[str] = Header(None)) -> dict:
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(401, "Connexion requise.")
-        try:
-            data = jwt.decode(authorization[7:], SECRET, algorithms=["HS256"])
-            u = users.find_one({"_id": ObjectId(data["sub"])})
-        except Exception:
-            raise HTTPException(401, "Session invalide ou expirée.")
-        if not u:
-            raise HTTPException(401, "Compte introuvable.")
-        return u
+    courant = creer_dependance_courant(users)
 
     def superadmin(u: dict = Depends(courant)) -> dict:
         if u["role"] != "superadmin":
