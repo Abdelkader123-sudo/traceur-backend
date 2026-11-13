@@ -22,6 +22,7 @@ from IA.ia_routes import creer_router, calculer_bilan, SEUIL_HEURES_ALERTE   # A
 from params import BORNES, DEFAUTS, FIXES, valider_parametres
 import trajectoire_service                                   # AJOUT LSTM
 from auth import creer_routeur                               # AJOUT AUTH
+from messagerie import creer_routeur_messagerie
 
 MQTT_HOST = os.getenv("MQTT_HOST", "ycf81881.ala.eu-central-1.emqxsl.com")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
@@ -623,6 +624,7 @@ app.include_router(creer_router(mesures_activite, appliquer_alerte_ia,
                                 lambda: P()["reference_jours"]))
 # AJOUT AUTH : /auth/etat, /auth/inscription, /auth/connexion, /auth/moi, /utilisateurs
 app.include_router(creer_routeur(base))
+app.include_router(creer_routeur_messagerie(base))
 
 
 # ---------------------------------------------------------------------------
