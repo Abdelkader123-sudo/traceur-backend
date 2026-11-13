@@ -11,9 +11,11 @@ import jwt
 from bson import ObjectId
 from fastapi import HTTPException
 from pydantic import ValidationError
+from pymongo import ReturnDocument
 
 from auth import (
     Connexion,
+    JetonSession,
     NouveauClient,
     NouveauCodeActivation,
     SECRET,
@@ -82,6 +84,21 @@ class CollectionMemoire:
         for document in documents:
             document.update(modification["$set"])
         return SimpleNamespace(modified_count=len(documents))
+
+    def find_one_and_update(self, filtre, modification, return_document=None):
+        document = self.find_one(filtre)
+        if not document:
+            return None
+        avant = dict(document)
+        document.update(modification["$set"])
+        return document if return_document == ReturnDocument.AFTER else avant
+
+    def delete_one(self, filtre):
+        document = self.find_one(filtre)
+        if not document:
+            return SimpleNamespace(deleted_count=0)
+        self.documents.remove(document)
+        return SimpleNamespace(deleted_count=1)
 
 
 class BaseMemoire:
@@ -201,6 +218,48 @@ class IsolationClientTests(unittest.TestCase):
         ))
 
         self.assertTrue(session["verification_biometrique_requise"])
+
+    def test_renouvellement_fait_pivoter_jeton_et_deconnexion_le_revoque(self):
+        base = BaseMemoire()
+        utilisateur = {
+            "_id": ObjectId(),
+            "nom": "Alice",
+            "nom_cle": "alice",
+            "role": "superadmin",
+            "client_id": ObjectId(),
+            "numero_client": "00000001",
+            "mot_de_passe": _hacher("mot-de-passe"),
+        }
+        base["utilisateurs"].insert_one(utilisateur)
+        routeur = creer_routeur(base)
+        authentifier = _route(routeur, "/auth/connexion", "POST")
+        resultat = authentifier(Connexion(
+            numero_client="00000001",
+            nom="Alice",
+            mot_de_passe="mot-de-passe",
+        ))
+        renouveler = _route(routeur, "/auth/renouveler", "POST")
+        deconnecter = _route(routeur, "/auth/deconnexion", "POST")
+
+        renouvele = renouveler(JetonSession(
+            refresh_token=resultat["refresh_token"],
+        ))
+        self.assertNotEqual(renouvele["refresh_token"], resultat["refresh_token"])
+        with self.assertRaises(HTTPException):
+            renouveler(JetonSession(refresh_token=resultat["refresh_token"]))
+
+        courant = creer_dependance_courant(
+            base["utilisateurs"],
+            base["sessions_authentification"],
+        )
+        self.assertIs(
+            courant(f"Bearer {renouvele['token']}"),
+            utilisateur,
+        )
+        deconnecter(JetonSession(refresh_token=renouvele["refresh_token"]))
+        with self.assertRaises(HTTPException) as erreur:
+            courant(f"Bearer {renouvele['token']}")
+        self.assertEqual(erreur.exception.status_code, 401)
 
     def test_jwt_ne_peut_pas_changer_de_client(self):
         client_id = ObjectId()
