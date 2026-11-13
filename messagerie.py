@@ -66,7 +66,10 @@ def creer_routeur_messagerie(db):
     messages.create_index([("conversation_id", 1), ("cree_le", -1)])
 
     router = APIRouter(prefix="/messagerie", tags=["messagerie"])
-    courant = creer_dependance_courant(users)
+    courant = creer_dependance_courant(
+        users,
+        db["sessions_authentification"],
+    )
 
     def exiger_conversation(conversation_id: str, utilisateur: dict) -> dict:
         if not ObjectId.is_valid(conversation_id):

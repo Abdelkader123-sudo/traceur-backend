@@ -79,7 +79,10 @@ parametres_col = base["parametres"]
 mesures_activite = base["mesures_activite"]    # AJOUT IA : un document par message (mi, steps, duree_s)
 lstm_evenements = base["lstm_alertes_silencieuses"]   # AJOUT NETTOYAGE
 clients_col = base["clients"]
-courant = creer_dependance_courant(base["utilisateurs"])
+courant = creer_dependance_courant(
+    base["utilisateurs"],
+    base["sessions_authentification"],
+)
 
 _cache_params = {}
 _cache_zone = {}

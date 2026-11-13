@@ -52,6 +52,10 @@ class NouveauCodeActivation(BaseModel):
     duree_jours: int = Field(default=30, ge=1, le=365)
 
 
+class JetonSession(BaseModel):
+    refresh_token: str = Field(min_length=32, max_length=256)
+
+
 def _cle(texte: str) -> str:
     return re.sub(r"\s+", " ", texte.strip()).lower()
 
@@ -69,6 +73,10 @@ def _verifier(mdp: str, empreinte: str) -> bool:
 
 def _hachage_code(code: str) -> str:
     return hashlib.sha256(code.encode()).hexdigest()
+
+
+def _hachage_jeton(jeton: str) -> str:
+    return hashlib.sha256(jeton.encode()).hexdigest()
 
 
 def _numero_client(clients) -> str:
@@ -128,7 +136,7 @@ def _migrer_client_existant(db, users, clients):
         )
 
 
-def creer_dependance_courant(users):
+def creer_dependance_courant(users, sessions=None):
     def courant(authorization: Optional[str] = Header(None)) -> dict:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(401, "Connexion requise.")
@@ -143,6 +151,16 @@ def creer_dependance_courant(users):
             raise HTTPException(403, "Le compte client doit être migré.")
         if data.get("client_id") and data["client_id"] != str(u["client_id"]):
             raise HTTPException(401, "Session invalide ou expirée.")
+        if "sid" in data:
+            try:
+                session_id = ObjectId(data["sid"])
+            except (TypeError, ValueError):
+                raise HTTPException(401, "Session invalide ou expirée.")
+            if sessions is None or not sessions.find_one({
+                "_id": session_id,
+                "utilisateur_id": u["_id"],
+            }):
+                raise HTTPException(401, "Session invalide ou expirée.")
         return u
 
     return courant
@@ -152,12 +170,14 @@ def creer_routeur(db) -> APIRouter:
     users = db["utilisateurs"]
     clients = db["clients"]
     codes = db["codes_activation"]
+    sessions = db["sessions_authentification"]
 
     _migrer_client_existant(db, users, clients)
 
     clients.create_index("numero_client", unique=True)
     codes.create_index("code_hash", unique=True)
     codes.create_index("expire_le", expireAfterSeconds=0)
+    sessions.create_index("refresh_token_hash", unique=True)
 
     indexes = users.index_information()
     for nom in ("nom_cle_1_prenom_cle_1", "est_superadmin_1"):
@@ -176,20 +196,38 @@ def creer_routeur(db) -> APIRouter:
 
     router = APIRouter(tags=["auth"])
     mdp_factice = _hacher("factice-pour-temps-constant")
-    courant = creer_dependance_courant(users)
+    courant = creer_dependance_courant(users, sessions)
 
     def superadmin(u: dict = Depends(courant)) -> dict:
         if u["role"] != "superadmin":
             raise HTTPException(403, "Réservé au super administrateur.")
         return u
 
-    def _reponse_session(u: dict) -> dict:
+    def _creer_session(u: dict) -> tuple[ObjectId, str]:
+        session_id = ObjectId()
+        refresh_token = secrets.token_urlsafe(48)
+        sessions.insert_one({
+            "_id": session_id,
+            "utilisateur_id": u["_id"],
+            "refresh_token_hash": _hachage_jeton(refresh_token),
+            "cree_le": datetime.now(timezone.utc),
+        })
+        return session_id, refresh_token
+
+    def _reponse_session(
+        u: dict,
+        session_id: Optional[ObjectId] = None,
+        refresh_token: Optional[str] = None,
+    ) -> dict:
+        if session_id is None or refresh_token is None:
+            session_id, refresh_token = _creer_session(u)
         exp = datetime.now(timezone.utc) + timedelta(hours=DUREE_H)
         jwt_token = jwt.encode(
             {
                 "sub": str(u["_id"]),
                 "role": u["role"],
                 "client_id": str(u["client_id"]),
+                "sid": str(session_id),
                 "exp": exp,
             },
             SECRET,
@@ -197,6 +235,7 @@ def creer_routeur(db) -> APIRouter:
         )
         return {
             "token": jwt_token,
+            "refresh_token": refresh_token,
             "utilisateur": _public(u),
             "verification_biometrique_requise": bool(
                 u.get("appareils_biometriques")
@@ -357,6 +396,38 @@ form.addEventListener('submit',async event=>{
         if len(valides) > 1:
             raise HTTPException(409, "Saisissez votre numéro client pour choisir votre espace.")
         raise HTTPException(401, "Numéro client, nom ou mot de passe incorrect.")
+
+    @router.post("/auth/renouveler")
+    def renouveler(corps: JetonSession):
+        nouveau_jeton = secrets.token_urlsafe(48)
+        session = sessions.find_one_and_update(
+            {"refresh_token_hash": _hachage_jeton(corps.refresh_token)},
+            {
+                "$set": {
+                    "refresh_token_hash": _hachage_jeton(nouveau_jeton),
+                    "renouvele_le": datetime.now(timezone.utc),
+                }
+            },
+            return_document=ReturnDocument.BEFORE,
+        )
+        if not session:
+            raise HTTPException(401, "Session invalide ou révoquée.")
+        utilisateur = users.find_one({"_id": session["utilisateur_id"]})
+        if not utilisateur:
+            sessions.delete_one({"_id": session["_id"]})
+            raise HTTPException(401, "Compte introuvable.")
+        return _reponse_session(
+            utilisateur,
+            session_id=session["_id"],
+            refresh_token=nouveau_jeton,
+        )
+
+    @router.post("/auth/deconnexion")
+    def deconnexion(corps: JetonSession):
+        sessions.delete_one({
+            "refresh_token_hash": _hachage_jeton(corps.refresh_token),
+        })
+        return {"ok": True}
 
     @router.get("/auth/moi")
     def moi(u: dict = Depends(courant)):
