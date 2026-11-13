@@ -2,11 +2,12 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 from pymongo.errors import DuplicateKeyError
 
 from auth import creer_dependance_courant
+from fcm_notifications import envoyer_notifications, fcm_prete
 
 
 class ConversationDirecte(BaseModel):
@@ -24,6 +25,10 @@ class NouveauMessage(BaseModel):
 
 class NouveauxMembres(BaseModel):
     membres: list[str] = Field(min_length=1, max_length=100)
+
+
+class InstallationFCM(BaseModel):
+    identifiant: str = Field(min_length=1, max_length=256)
 
 
 def _object_id(valeur: str) -> ObjectId:
@@ -122,6 +127,46 @@ def creer_routeur_messagerie(db):
                 "client_id": utilisateur["client_id"],
             })
         ]
+
+    @router.post("/installation-fcm", status_code=204)
+    def enregistrer_installation_fcm(
+        corps: InstallationFCM,
+        utilisateur: dict = Depends(courant),
+    ) -> Response:
+        if not fcm_prete():
+            raise HTTPException(
+                status_code=503,
+                detail="Les notifications FCM ne sont pas configurées sur le serveur.",
+            )
+        users.update_many(
+            {
+                "_id": {"$ne": utilisateur["_id"]},
+                "fcm_installation_ids": corps.identifiant,
+            },
+            {"$pull": {"fcm_installation_ids": corps.identifiant}},
+        )
+        users.update_one(
+            {
+                "_id": utilisateur["_id"],
+                "client_id": utilisateur["client_id"],
+            },
+            {"$addToSet": {"fcm_installation_ids": corps.identifiant}},
+        )
+        return Response(status_code=204)
+
+    @router.delete("/installation-fcm", status_code=204)
+    def supprimer_installation_fcm(
+        corps: InstallationFCM,
+        utilisateur: dict = Depends(courant),
+    ) -> Response:
+        users.update_one(
+            {
+                "_id": utilisateur["_id"],
+                "client_id": utilisateur["client_id"],
+            },
+            {"$pull": {"fcm_installation_ids": corps.identifiant}},
+        )
+        return Response(status_code=204)
 
     @router.get("/conversations")
     def lister_conversations(utilisateur: dict = Depends(courant)):
@@ -234,6 +279,7 @@ def creer_routeur_messagerie(db):
     def envoyer_message(
         conversation_id: str,
         corps: NouveauMessage,
+        background_tasks: BackgroundTasks,
         utilisateur: dict = Depends(courant),
     ):
         conversation = exiger_conversation(conversation_id, utilisateur)
@@ -258,6 +304,27 @@ def creer_routeur_messagerie(db):
                 "updated_at": maintenant,
             }},
         )
+        if fcm_prete():
+            destinataires = users.find({
+                "_id": {"$in": [
+                    membre for membre in conversation["membres"]
+                    if membre != utilisateur["_id"]
+                ]},
+                "client_id": utilisateur["client_id"],
+                "fcm_installation_ids": {"$exists": True, "$ne": []},
+            })
+            identifiants = [
+                identifiant
+                for destinataire in destinataires
+                for identifiant in destinataire.get("fcm_installation_ids", [])
+            ]
+            if identifiants:
+                background_tasks.add_task(
+                    _notifier_nouveaux_messages,
+                    users,
+                    identifiants,
+                    str(conversation["_id"]),
+                )
         return _message_public(document)
 
     @router.post("/conversations/{conversation_id}/membres", status_code=200)
@@ -287,3 +354,21 @@ def creer_routeur_messagerie(db):
         return conversation_publique(conversation, utilisateur)
 
     return router
+
+
+def _notifier_nouveaux_messages(
+    users,
+    identifiants_installation: list[str],
+    conversation_id: str,
+) -> None:
+    identifiants_invalides = envoyer_notifications(
+        identifiants_installation,
+        "Nouveau message",
+        "Vous avez reçu un nouveau message.",
+        {"type": "nouveau_message", "conversation_id": conversation_id},
+    )
+    if identifiants_invalides:
+        users.update_many(
+            {"fcm_installation_ids": {"$in": identifiants_invalides}},
+            {"$pull": {"fcm_installation_ids": {"$in": identifiants_invalides}}},
+        )
