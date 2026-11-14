@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -8,6 +9,8 @@ from pymongo.errors import DuplicateKeyError
 
 from auth import creer_dependance_courant
 from fcm_notifications import envoyer_notifications, fcm_prete
+
+_log = logging.getLogger(__name__)
 
 
 class ConversationDirecte(BaseModel):
@@ -304,26 +307,38 @@ def creer_routeur_messagerie(db):
                 "updated_at": maintenant,
             }},
         )
-        if fcm_prete():
-            destinataires = users.find({
+        if not fcm_prete():
+            _log.warning("Push FCM non planifié : le service Firebase n’est pas prêt.")
+        else:
+            destinataires = list(users.find({
                 "_id": {"$in": [
                     membre for membre in conversation["membres"]
                     if membre != utilisateur["_id"]
                 ]},
                 "client_id": utilisateur["client_id"],
                 "fcm_installation_ids": {"$exists": True, "$ne": []},
-            })
+            }))
             identifiants = [
                 identifiant
                 for destinataire in destinataires
                 for identifiant in destinataire.get("fcm_installation_ids", [])
             ]
             if identifiants:
+                _log.info(
+                    "Push FCM planifié : %d destinataire(s), %d installation(s).",
+                    len(destinataires),
+                    len(identifiants),
+                )
                 background_tasks.add_task(
                     _notifier_nouveaux_messages,
                     users,
                     identifiants,
                     str(conversation["_id"]),
+                )
+            else:
+                _log.warning(
+                    "Push FCM non planifié : aucun destinataire n’a d’installation "
+                    "enregistrée."
                 )
         return _message_public(document)
 
@@ -368,6 +383,10 @@ def _notifier_nouveaux_messages(
         {"type": "nouveau_message", "conversation_id": conversation_id},
     )
     if identifiants_invalides:
+        _log.warning(
+            "FCM a déclaré %d installation(s) invalide(s); elles seront supprimées.",
+            len(identifiants_invalides),
+        )
         users.update_many(
             {"fcm_installation_ids": {"$in": identifiants_invalides}},
             {"$pull": {"fcm_installation_ids": {"$in": identifiants_invalides}}},

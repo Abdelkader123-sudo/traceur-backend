@@ -76,8 +76,10 @@ def envoyer_notifications(
                 ),
                 app=application,
             )
+            _log.info("Notification acceptée par Firebase.")
         except messaging.UnregisteredError:
             identifiants_invalides.append(identifiant)
+            _log.warning("Firebase a signalé une installation non enregistrée.")
         except FirebaseError:
             _log.exception("Échec d’envoi d’une notification FCM.")
     return identifiants_invalides
