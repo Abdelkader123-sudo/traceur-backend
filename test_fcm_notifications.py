@@ -13,7 +13,7 @@ class NotificationsFcmTests(unittest.TestCase):
         envoyer,
     ):
         envoyer_notifications(
-            ["installation-de-test"],
+            ["jeton-fcm-de-test"],
             "Nouveau message",
             "Vous avez reçu un nouveau message.",
             {"type": "nouveau_message", "conversation_id": "conversation-1"},
@@ -29,7 +29,17 @@ class NotificationsFcmTests(unittest.TestCase):
                 "conversation_id": "conversation-1",
             },
         )
-        self.assertEqual(message.fid, "installation-de-test")
+        self.assertEqual(message.token, "jeton-fcm-de-test")
+        self.assertEqual(message.notification.title, "Nouveau message")
+        self.assertEqual(
+            message.notification.body,
+            "Vous avez reçu un nouveau message.",
+        )
+        self.assertEqual(message.android.priority, "high")
+        self.assertEqual(
+            message.android.notification.channel_id,
+            "traceur_messages",
+        )
         self.assertNotIn("texte", message.data)
 
 

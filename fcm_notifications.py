@@ -66,20 +66,29 @@ def envoyer_notifications(
         try:
             messaging.send(
                 messaging.Message(
-                    fid=identifiant,
+                    token=identifiant,
+                    notification=messaging.Notification(
+                        title=titre,
+                        body=texte,
+                    ),
                     data={
                         "title": titre,
                         "body": texte,
                         **donnees,
                     },
-                    android=messaging.AndroidConfig(priority="high"),
+                    android=messaging.AndroidConfig(
+                        priority="high",
+                        notification=messaging.AndroidNotification(
+                            channel_id="traceur_messages",
+                        ),
+                    ),
                 ),
                 app=application,
             )
             _log.info("Notification acceptée par Firebase.")
         except messaging.UnregisteredError:
             identifiants_invalides.append(identifiant)
-            _log.warning("Firebase a signalé une installation non enregistrée.")
+            _log.warning("Firebase a signalé un jeton FCM non enregistré.")
         except FirebaseError:
             _log.exception("Échec d’envoi d’une notification FCM.")
     return identifiants_invalides
