@@ -16,11 +16,16 @@ from pymongo import ReturnDocument
 from auth import (
     Connexion,
     JetonSession,
+    ModifierProfilClient,
     NouveauClient,
     NouveauCodeActivation,
+    NouvelUtilisateur,
+    PermissionsUtilisateur,
     SECRET,
+    _hachage_cin,
     _hacher,
     _migrer_client_existant,
+    _verifier,
     creer_dependance_courant,
     creer_routeur,
 )
@@ -99,6 +104,23 @@ class CollectionMemoire:
             return SimpleNamespace(deleted_count=0)
         self.documents.remove(document)
         return SimpleNamespace(deleted_count=1)
+
+    def update_one(self, filtre, modification):
+        document = self.find_one(filtre)
+        if not document:
+            return SimpleNamespace(modified_count=0)
+        document.update(modification["$set"])
+        return SimpleNamespace(modified_count=1)
+
+    def delete_many(self, filtre):
+        documents = [
+            document
+            for document in self.documents
+            if self._correspond(document, filtre)
+        ]
+        for document in documents:
+            self.documents.remove(document)
+        return SimpleNamespace(deleted_count=len(documents))
 
 
 class BaseMemoire:
@@ -218,6 +240,257 @@ class IsolationClientTests(unittest.TestCase):
         ))
 
         self.assertTrue(session["verification_biometrique_requise"])
+        self.assertEqual(session["utilisateur"]["role"], "client")
+
+    def test_connexion_par_mot_de_passe_dans_la_ferme_associee(self):
+        base = BaseMemoire()
+        utilisateur = {
+            "_id": ObjectId(),
+            "nom": "Alice",
+            "nom_cle": "alice",
+            "role": "utilisateur",
+            "client_id": ObjectId(),
+            "numero_client": "00000001",
+            "mot_de_passe": _hacher("mot-de-passe"),
+        }
+        base["utilisateurs"].insert_one(utilisateur)
+        connexion = _route(creer_routeur(base), "/auth/connexion", "POST")
+
+        session = connexion(Connexion(
+            numero_client="00000001",
+            mot_de_passe="mot-de-passe",
+        ))
+
+        self.assertEqual(session["utilisateur"]["id"], str(utilisateur["_id"]))
+
+    def test_connexion_sans_ferme_ou_nom_est_refusee(self):
+        connexion = _route(
+            creer_routeur(BaseMemoire()),
+            "/auth/connexion",
+            "POST",
+        )
+        with self.assertRaises(HTTPException) as erreur:
+            connexion(Connexion(mot_de_passe="mot-de-passe"))
+        self.assertEqual(erreur.exception.status_code, 422)
+
+    def test_creation_et_modification_des_pages_autorisees(self):
+        base = BaseMemoire()
+        routeur = creer_routeur(base)
+        client = {
+            "_id": ObjectId(),
+            "role": "superadmin",
+            "client_id": ObjectId(),
+            "numero_client": "00000001",
+        }
+        creer = _route(routeur, "/utilisateurs", "POST")
+        utilisateur = creer(
+            NouvelUtilisateur(
+                nom="Alice",
+                prenom="Test",
+                residence="Rabat",
+                telephone="0612345678",
+                cin="12345678",
+                pages_autorisees=["map", "notifications"],
+            ),
+            u=client,
+        )
+        self.assertEqual(utilisateur["role"], "utilisateur")
+        self.assertEqual(
+            utilisateur["pages_autorisees"],
+            ["map", "notifications"],
+        )
+        self.assertNotIn("age", utilisateur)
+
+        modifier = _route(
+            routeur,
+            "/utilisateurs/{user_id}/permissions",
+            "PATCH",
+        )
+        resultat = modifier(
+            utilisateur["id"],
+            PermissionsUtilisateur(
+                pages_autorisees=["map", "alerts", "notifications"]
+            ),
+            u=client,
+        )
+        self.assertEqual(
+            resultat["pages_autorisees"],
+            ["map", "alerts", "notifications"],
+        )
+
+    def test_cin_unique_entre_clients_et_stocke_sous_forme_de_hachage(self):
+        base = BaseMemoire()
+        creer = _route(creer_routeur(base), "/utilisateurs", "POST")
+        client_a = {
+            "_id": ObjectId(),
+            "role": "superadmin",
+            "client_id": ObjectId(),
+            "numero_client": "00000001",
+        }
+        client_b = {
+            "_id": ObjectId(),
+            "role": "superadmin",
+            "client_id": ObjectId(),
+            "numero_client": "00000002",
+        }
+        premier = creer(
+            NouvelUtilisateur(
+                nom="Alice",
+                prenom="Test",
+                residence="Rabat",
+                telephone="0612345678",
+                cin="12345678",
+                pages_autorisees=["map"],
+            ),
+            u=client_a,
+        )
+        enregistre = base["utilisateurs"].find_one({"_id": ObjectId(premier["id"])})
+        self.assertEqual(enregistre["cin_hash"], _hachage_cin("12345678"))
+        self.assertNotIn("cin", enregistre)
+
+        with self.assertRaises(HTTPException) as erreur:
+            creer(
+                NouvelUtilisateur(
+                    nom="Bob",
+                    prenom="Test",
+                    residence="Tunis",
+                    telephone="0612345679",
+                    cin="12345678",
+                    pages_autorisees=["map"],
+                ),
+                u=client_b,
+            )
+        self.assertEqual(erreur.exception.status_code, 409)
+        self.assertIn("CIN", erreur.exception.detail)
+
+    def test_cin_deja_present_dans_un_compte_historique_est_reconnu(self):
+        base = BaseMemoire()
+        users = base["utilisateurs"]
+        ancien_id = ObjectId()
+        users.insert_one({
+            "_id": ancien_id,
+            "role": "utilisateur",
+            "mot_de_passe": _hacher("87654321"),
+        })
+        creer = _route(creer_routeur(base), "/utilisateurs", "POST")
+
+        with self.assertRaises(HTTPException) as erreur:
+            creer(
+                NouvelUtilisateur(
+                    nom="Nouveau",
+                    prenom="Compte",
+                    residence="Rabat",
+                    telephone="0612345678",
+                    cin="87654321",
+                    pages_autorisees=["map"],
+                ),
+                u={
+                    "_id": ObjectId(),
+                    "role": "superadmin",
+                    "client_id": ObjectId(),
+                    "numero_client": "00000001",
+                },
+            )
+
+        self.assertEqual(erreur.exception.status_code, 409)
+        self.assertEqual(
+            users.find_one({"_id": ancien_id})["cin_hash"],
+            _hachage_cin("87654321"),
+        )
+
+    def test_le_client_modifie_son_profil_et_le_changement_de_mot_de_passe(self):
+        base = BaseMemoire()
+        routeur = creer_routeur(base)
+        client_id = ObjectId()
+        utilisateur = {
+            "_id": ObjectId(),
+            "role": "superadmin",
+            "est_superadmin": True,
+            "client_id": client_id,
+            "numero_client": "00000001",
+            "nom": "Ancien nom",
+            "prenom": "",
+            "nom_cle": "ancien nom",
+            "prenom_cle": "",
+            "telephone": "",
+            "residence": "",
+            "mot_de_passe": _hacher("ancien-mot-de-passe"),
+        }
+        base["utilisateurs"].insert_one(utilisateur)
+        base["clients"].insert_one({
+            "_id": client_id,
+            "numero_client": "00000001",
+            "nom": "Ancien nom",
+        })
+        session_courante = ObjectId()
+        session_autre = ObjectId()
+        base["sessions_authentification"].insert_one({
+            "_id": session_courante,
+            "utilisateur_id": utilisateur["_id"],
+        })
+        base["sessions_authentification"].insert_one({
+            "_id": session_autre,
+            "utilisateur_id": utilisateur["_id"],
+        })
+        jeton = jwt.encode(
+            {
+                "sub": str(utilisateur["_id"]),
+                "sid": str(session_courante),
+                "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+            },
+            SECRET,
+            algorithm="HS256",
+        )
+
+        modifier = _route(routeur, "/auth/profil", "PATCH")
+        resultat = modifier(
+            ModifierProfilClient(
+                nom="Nouveau nom",
+                telephone="0612345678",
+                residence="Rabat",
+                mot_de_passe_actuel="ancien-mot-de-passe",
+                nouveau_mot_de_passe="nouveau-mot-de-passe",
+            ),
+            u=utilisateur,
+            authorization=f"Bearer {jeton}",
+        )
+
+        self.assertEqual(resultat["nom"], "Nouveau nom")
+        self.assertEqual(resultat["telephone"], "0612345678")
+        self.assertEqual(resultat["residence"], "Rabat")
+        self.assertTrue(
+            _verifier(
+                "nouveau-mot-de-passe",
+                base["utilisateurs"].find_one({"_id": utilisateur["_id"]})[
+                    "mot_de_passe"
+                ],
+            )
+        )
+        self.assertEqual(
+            base["clients"].find_one({"_id": client_id})["nom"],
+            "Nouveau nom",
+        )
+        self.assertIsNotNone(
+            base["sessions_authentification"].find_one({
+                "_id": session_courante,
+            })
+        )
+        self.assertIsNone(
+            base["sessions_authentification"].find_one({
+                "_id": session_autre,
+            })
+        )
+
+    def test_un_utilisateur_ne_peut_pas_modifier_le_profil_du_client(self):
+        routeur = creer_routeur(BaseMemoire())
+        modifier = _route(routeur, "/auth/profil", "PATCH")
+        with self.assertRaises(HTTPException) as erreur:
+            modifier(
+                ModifierProfilClient(nom="Nouveau nom"),
+                u={"role": "utilisateur"},
+                authorization=None,
+            )
+        self.assertEqual(erreur.exception.status_code, 403)
 
     def test_renouvellement_fait_pivoter_jeton_et_deconnexion_le_revoque(self):
         base = BaseMemoire()

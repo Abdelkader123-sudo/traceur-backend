@@ -1,12 +1,13 @@
 """Authentification et isolation des comptes clients (FastAPI + MongoDB)."""
-import hashlib
 import base64
+import hashlib
+import hmac
 import io
 import os
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 import bcrypt
 import jwt
@@ -21,13 +22,23 @@ from qrcode.image.svg import SvgPathImage
 
 SECRET = os.environ["JWT_SECRET"]
 DUREE_H = int(os.getenv("JWT_DUREE_H", "12"))
+PAGES_AUTORISEES = (
+    "map",
+    "herds",
+    "alerts",
+    "notifications",
+    "animals",
+    "history",
+    "messages",
+    "settings",
+)
 
 
 class Connexion(BaseModel):
     numero_client: Optional[str] = Field(
         None, min_length=8, max_length=8, pattern=r"^\d{8}$"
     )
-    nom: str = Field(min_length=1, max_length=60)
+    nom: Optional[str] = Field(None, min_length=1, max_length=60)
     mot_de_passe: str = Field(min_length=1, max_length=72)
 
 
@@ -38,14 +49,31 @@ class NouveauClient(BaseModel):
     ferme: str = Field(min_length=1, max_length=80)
 
 
+class ModifierProfilClient(BaseModel):
+    nom: str = Field(min_length=2, max_length=60)
+    telephone: str = Field(default="", max_length=20)
+    residence: str = Field(default="", max_length=120)
+    mot_de_passe_actuel: Optional[str] = Field(None, min_length=1, max_length=72)
+    nouveau_mot_de_passe: Optional[str] = Field(None, min_length=8, max_length=72)
+
+
 class NouvelUtilisateur(BaseModel):
     nom: str = Field(min_length=1, max_length=60)
     prenom: str = Field(min_length=1, max_length=60)
-    age: int = Field(ge=0, le=120)
     residence: str = Field(min_length=1, max_length=120)
     telephone: str = Field(min_length=6, max_length=20)
     cin: str = Field(pattern=r"^\d{8}$")
-    role: Literal["utilisateur", "admin"] = "utilisateur"
+    pages_autorisees: List[Literal[
+        "map", "herds", "alerts", "notifications", "animals", "history",
+        "messages", "settings"
+    ]]
+
+
+class PermissionsUtilisateur(BaseModel):
+    pages_autorisees: List[Literal[
+        "map", "herds", "alerts", "notifications", "animals", "history",
+        "messages", "settings"
+    ]]
 
 
 class NouveauCodeActivation(BaseModel):
@@ -75,8 +103,38 @@ def _hachage_code(code: str) -> str:
     return hashlib.sha256(code.encode()).hexdigest()
 
 
+def _hachage_cin(cin: str) -> str:
+    return hmac.new(
+        SECRET.encode(),
+        cin.strip().encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def _hachage_jeton(jeton: str) -> str:
     return hashlib.sha256(jeton.encode()).hexdigest()
+
+
+def _cin_deja_utilise(users, cin: str, cin_hash: str) -> bool:
+    if users.find_one({"cin_hash": cin_hash}, {"_id": 1}):
+        return True
+
+    anciens = users.find(
+        {
+            "role": {"$ne": "superadmin"},
+            "cin_hash": {"$exists": False},
+        },
+        {"mot_de_passe": 1},
+    )
+    for utilisateur in anciens:
+        empreinte = utilisateur.get("mot_de_passe")
+        if isinstance(empreinte, str) and _verifier(cin, empreinte):
+            users.update_one(
+                {"_id": utilisateur["_id"], "cin_hash": {"$exists": False}},
+                {"$set": {"cin_hash": cin_hash}},
+            )
+            return True
+    return False
 
 
 def _numero_client(clients) -> str:
@@ -92,12 +150,18 @@ def _public(u: dict) -> dict:
         "id": str(u["_id"]),
         "nom": u["nom"],
         "prenom": u.get("prenom", ""),
-        "age": u.get("age"),
         "residence": u.get("residence", ""),
         "telephone": u.get("telephone", ""),
-        "role": u["role"],
+        "role": (
+            "client"
+            if u["role"] == "superadmin"
+            else "utilisateur"
+            if u["role"] == "admin"
+            else u["role"]
+        ),
         "numero_client": u["numero_client"],
         "biometrie_activee": bool(u.get("appareils_biometriques")),
+        "pages_autorisees": u.get("pages_autorisees", list(PAGES_AUTORISEES)),
     }
 
 
@@ -173,11 +237,17 @@ def creer_routeur(db) -> APIRouter:
     sessions = db["sessions_authentification"]
 
     _migrer_client_existant(db, users, clients)
+    users.update_many({"role": "admin"}, {"$set": {"role": "utilisateur"}})
 
     clients.create_index("numero_client", unique=True)
     codes.create_index("code_hash", unique=True)
     codes.create_index("expire_le", expireAfterSeconds=0)
     sessions.create_index("refresh_token_hash", unique=True)
+    users.create_index(
+        "cin_hash",
+        unique=True,
+        partialFilterExpression={"cin_hash": {"$type": "string"}},
+    )
 
     indexes = users.index_information()
     for nom in ("nom_cle_1_prenom_cle_1", "est_superadmin_1"):
@@ -381,8 +451,14 @@ form.addEventListener('submit',async event=>{
 
     @router.post("/auth/connexion")
     def connexion(corps: Connexion):
-        filtre = {"nom_cle": _cle(corps.nom)}
-        if corps.numero_client:
+        if not corps.numero_client and not corps.nom:
+            raise HTTPException(422, "Associez votre ferme pour vous connecter.")
+        filtre = (
+            {"numero_client": corps.numero_client.strip()}
+            if corps.numero_client and not corps.nom
+            else {"nom_cle": _cle(corps.nom)}
+        )
+        if corps.numero_client and corps.nom:
             filtre["numero_client"] = corps.numero_client.strip()
         candidats = list(users.find(filtre))
         if not candidats:
@@ -394,7 +470,11 @@ form.addEventListener('submit',async event=>{
         if len(valides) == 1:
             return _reponse_session(valides[0])
         if len(valides) > 1:
-            raise HTTPException(409, "Saisissez votre numéro client pour choisir votre espace.")
+            raise HTTPException(
+                409,
+                "Plusieurs comptes utilisent ce mot de passe dans cette ferme. "
+                "Contactez le client pour choisir un mot de passe unique.",
+            )
         raise HTTPException(401, "Numéro client, nom ou mot de passe incorrect.")
 
     @router.post("/auth/renouveler")
@@ -433,6 +513,90 @@ form.addEventListener('submit',async event=>{
     def moi(u: dict = Depends(courant)):
         return _public(u)
 
+    @router.patch("/auth/profil")
+    def modifier_profil_client(
+        corps: ModifierProfilClient,
+        u: dict = Depends(courant),
+        authorization: Optional[str] = Header(None),
+    ):
+        if u["role"] != "superadmin":
+            raise HTTPException(403, "Réservé au client propriétaire.")
+
+        nom = corps.nom.strip()
+        if len(nom) < 2:
+            raise HTTPException(422, "Le nom doit contenir au moins 2 caractères.")
+
+        change_mot_de_passe = (
+            corps.mot_de_passe_actuel is not None
+            or corps.nouveau_mot_de_passe is not None
+        )
+        if change_mot_de_passe:
+            if (
+                corps.mot_de_passe_actuel is None
+                or corps.nouveau_mot_de_passe is None
+            ):
+                raise HTTPException(
+                    422,
+                    "Saisissez le mot de passe actuel et le nouveau mot de passe.",
+                )
+            if not _verifier(corps.mot_de_passe_actuel, u["mot_de_passe"]):
+                raise HTTPException(400, "Le mot de passe actuel est incorrect.")
+
+        session_id = None
+        if authorization and authorization.startswith("Bearer "):
+            try:
+                claims = jwt.decode(
+                    authorization[7:],
+                    SECRET,
+                    algorithms=["HS256"],
+                )
+                if claims.get("sid"):
+                    session_id = ObjectId(claims["sid"])
+            except (jwt.InvalidTokenError, TypeError, ValueError):
+                raise HTTPException(401, "Session invalide ou expirée.")
+
+        valeurs = {
+            "nom": nom,
+            "nom_cle": _cle(nom),
+            "telephone": corps.telephone.strip(),
+            "residence": corps.residence.strip(),
+            "profil_modifie_le": datetime.now(timezone.utc),
+        }
+        if corps.nouveau_mot_de_passe is not None:
+            valeurs["mot_de_passe"] = _hacher(corps.nouveau_mot_de_passe)
+
+        try:
+            utilisateur = users.find_one_and_update(
+                {"_id": u["_id"], "role": "superadmin"},
+                {"$set": valeurs},
+                return_document=ReturnDocument.AFTER,
+            )
+        except DuplicateKeyError:
+            raise HTTPException(
+                409,
+                "Un compte avec ce nom existe déjà pour ce client.",
+            )
+
+        if utilisateur is None:
+            raise HTTPException(404, "Compte client introuvable.")
+
+        clients.update_one(
+            {"_id": u["client_id"]},
+            {
+                "$set": {
+                    "nom": nom,
+                    "telephone": corps.telephone.strip(),
+                    "residence": corps.residence.strip(),
+                }
+            },
+        )
+        if corps.nouveau_mot_de_passe is not None and session_id is not None:
+            sessions.delete_many({
+                "utilisateur_id": u["_id"],
+                "_id": {"$ne": session_id},
+            })
+        return _public(utilisateur)
+
     @router.get("/utilisateurs")
     def lister(u: dict = Depends(superadmin)):
         liste = users.find({
@@ -443,25 +607,64 @@ form.addEventListener('submit',async event=>{
 
     @router.post("/utilisateurs", status_code=201)
     def ajouter(corps: NouvelUtilisateur, u: dict = Depends(superadmin)):
+        if not corps.pages_autorisees:
+            raise HTTPException(422, "Sélectionnez au moins une page.")
+        cin_hash = _hachage_cin(corps.cin)
+        if _cin_deja_utilise(users, corps.cin, cin_hash):
+            raise HTTPException(
+                409,
+                "Ce CIN est déjà utilisé par un autre utilisateur.",
+            )
         doc = {
             "nom": corps.nom.strip(),
             "prenom": corps.prenom.strip(),
             "nom_cle": _cle(corps.nom),
             "prenom_cle": _cle(corps.prenom),
-            "age": corps.age,
             "residence": corps.residence.strip(),
             "telephone": corps.telephone.strip(),
-            "role": corps.role,
+            "role": "utilisateur",
+            "pages_autorisees": corps.pages_autorisees,
             "client_id": u["client_id"],
             "numero_client": u["numero_client"],
             "mot_de_passe": _hacher(corps.cin),
+            "cin_hash": cin_hash,
             "cree_le": datetime.now(timezone.utc),
         }
         try:
             doc["_id"] = users.insert_one(doc).inserted_id
         except DuplicateKeyError:
+            if users.find_one({"cin_hash": cin_hash}, {"_id": 1}):
+                raise HTTPException(
+                    409,
+                    "Ce CIN est déjà utilisé par un autre utilisateur.",
+                )
             raise HTTPException(409, "Un utilisateur avec ce nom et ce prénom existe déjà.")
         return _public(doc)
+
+    @router.patch("/utilisateurs/{user_id}/permissions")
+    def modifier_permissions(
+        user_id: str,
+        corps: PermissionsUtilisateur,
+        u: dict = Depends(superadmin),
+    ):
+        if not corps.pages_autorisees:
+            raise HTTPException(422, "Sélectionnez au moins une page.")
+        try:
+            oid = ObjectId(user_id)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Identifiant invalide.")
+        utilisateur = users.find_one_and_update(
+            {
+                "_id": oid,
+                "client_id": u["client_id"],
+                "role": {"$ne": "superadmin"},
+            },
+            {"$set": {"pages_autorisees": corps.pages_autorisees}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if utilisateur is None:
+            raise HTTPException(404, "Utilisateur introuvable.")
+        return _public(utilisateur)
 
     @router.delete("/utilisateurs/{user_id}")
     def supprimer(user_id: str, u: dict = Depends(superadmin)):
