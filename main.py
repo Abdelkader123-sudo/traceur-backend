@@ -1,4 +1,7 @@
 import asyncio
+import base64
+import binascii
+import io
 import json
 import math
 import os
@@ -10,12 +13,14 @@ from typing import Literal, Optional
 
 import paho.mqtt.client as mqtt
 from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException,
-                     WebSocket, WebSocketDisconnect)
+                     Response, WebSocket, WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
 from bson import ObjectId
+from gridfs import GridFSBucket
+from gridfs.errors import NoFile
 from pymongo import MongoClient
-from pymongo.errors import OperationFailure
+from pymongo.errors import OperationFailure, PyMongoError
 
 from DBSCAN import analyser_troupeaux, deplacement_inhabituel, est_immobile
 from geofence import analyser_point, valider_sommets
@@ -74,6 +79,7 @@ positions = base["positions"]
 alerts = base["alerts"]
 etat_animaux = base["etat_animaux"]
 animaux = base["animaux"]                      # fiches des animaux (type, sexe, âge, poids)
+photos_animaux = GridFSBucket(base, bucket_name="photos_animaux")
 pasture = base["pastures"]
 parametres_col = base["parametres"]
 mesures_activite = base["mesures_activite"]    # AJOUT IA : un document par message (mi, steps, duree_s)
@@ -176,6 +182,38 @@ class InfoAnimal(BaseModel):
     age_ans: Optional[float] = Field(None, ge=0, le=40)
     poids_kg: Optional[float] = Field(None, gt=0, le=1500)
     ferme: str = Field(default="Ferme principale", min_length=1, max_length=80)
+
+
+class PhotoAnimal(BaseModel):
+    contenu_base64: str = Field(..., max_length=5_600_000)
+    type_contenu: Literal["image/jpeg", "image/png", "image/webp"]
+
+
+TAILLE_MAX_PHOTO_ANIMAL = 4 * 1024 * 1024
+
+
+def decoder_photo_animal(photo: PhotoAnimal) -> bytes:
+    try:
+        contenu = base64.b64decode(photo.contenu_base64, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(400, "Le fichier image est invalide.")
+    if not contenu:
+        raise HTTPException(400, "Le fichier image est vide.")
+    if len(contenu) > TAILLE_MAX_PHOTO_ANIMAL:
+        raise HTTPException(413, "La photo ne doit pas dépasser 4 Mo.")
+
+    signatures = {
+        "image/jpeg": contenu.startswith(b"\xff\xd8\xff"),
+        "image/png": contenu.startswith(b"\x89PNG\r\n\x1a\n"),
+        "image/webp": (
+            len(contenu) >= 12
+            and contenu[:4] == b"RIFF"
+            and contenu[8:12] == b"WEBP"
+        ),
+    }
+    if not signatures[photo.type_contenu]:
+        raise HTTPException(400, "Le type du fichier ne correspond pas à son contenu.")
+    return contenu
 
 
 # ---------------------------------------------------------------------------
@@ -1032,10 +1070,21 @@ def lancer_nettoyage(u: dict = Depends(courant)):
 @app.get("/animaux")
 def lire_animaux(u: dict = Depends(courant)):
     """Liste des fiches enregistrées (utilisée par la page « Mon troupeau »)."""
-    return list(animaux.find(
+    fiches = animaux.find(
         {"client_id": u["client_id"]},
         {"_id": 0, "modifie_le": 0, "client_id": 0},
-    ))
+    )
+    resultat = []
+    for fiche in fiches:
+        image_id = fiche.pop("image_id", None)
+        fiche.pop("image_content_type", None)
+        photo_modifiee = fiche.pop("image_modifie_le", None)
+        fiche["photo_disponible"] = image_id is not None
+        fiche["photo_version"] = (
+            photo_modifiee.isoformat() if photo_modifiee is not None else None
+        )
+        resultat.append(fiche)
+    return resultat
 
 
 @app.put("/animaux/{animal_id}")
@@ -1043,14 +1092,98 @@ def enregistrer_animal(animal_id: str, info: InfoAnimal,
                        u: dict = Depends(courant)):
     """Crée ou met à jour la fiche d'un animal."""
     fiche = info.model_dump()
+    filtre = {"client_id": u["client_id"], "animal_id": animal_id}
     animaux.update_one(
-        {"client_id": u["client_id"], "animal_id": animal_id},
+        filtre,
         {"$set": {**fiche, "numero_client": u["numero_client"],
                   "modifie_le": datetime.now(timezone.utc)},
          "$setOnInsert": {"client_id": u["client_id"], "animal_id": animal_id}},
         upsert=True,
     )
-    return {"animal_id": animal_id, **fiche, "numero_client": u["numero_client"]}
+    actuel = animaux.find_one(filtre, {"image_id": 1, "image_modifie_le": 1}) or {}
+    photo_modifiee = actuel.get("image_modifie_le")
+    return {
+        "animal_id": animal_id,
+        **fiche,
+        "numero_client": u["numero_client"],
+        "photo_disponible": actuel.get("image_id") is not None,
+        "photo_version": (
+            photo_modifiee.isoformat() if photo_modifiee is not None else None
+        ),
+    }
+
+
+@app.put("/animaux/{animal_id}/image")
+def enregistrer_photo_animal(
+    animal_id: str,
+    photo: PhotoAnimal,
+    u: dict = Depends(courant),
+):
+    contenu = decoder_photo_animal(photo)
+    filtre = {"client_id": u["client_id"], "animal_id": animal_id}
+    actuel = animaux.find_one(filtre, {"image_id": 1}) or {}
+    image_id = photos_animaux.upload_from_stream(
+        f"{animal_id}",
+        io.BytesIO(contenu),
+        metadata={
+            "client_id": str(u["client_id"]),
+            "animal_id": animal_id,
+            "content_type": photo.type_contenu,
+        },
+    )
+    photo_modifiee = datetime.now(timezone.utc)
+    try:
+        animaux.update_one(
+            filtre,
+            {
+                "$set": {
+                    "image_id": image_id,
+                    "image_content_type": photo.type_contenu,
+                    "image_modifie_le": photo_modifiee,
+                    "numero_client": u["numero_client"],
+                },
+                "$setOnInsert": {
+                    "client_id": u["client_id"],
+                    "animal_id": animal_id,
+                },
+            },
+            upsert=True,
+        )
+    except PyMongoError:
+        photos_animaux.delete(image_id)
+        raise
+
+    ancienne_image = actuel.get("image_id")
+    if ancienne_image is not None:
+        try:
+            photos_animaux.delete(ancienne_image)
+        except NoFile:
+            pass
+
+    return {
+        "animal_id": animal_id,
+        "photo_disponible": True,
+        "photo_version": photo_modifiee.isoformat(),
+    }
+
+
+@app.get("/animaux/{animal_id}/image")
+def lire_photo_animal(animal_id: str, u: dict = Depends(courant)):
+    fiche = animaux.find_one(
+        {"client_id": u["client_id"], "animal_id": animal_id},
+        {"image_id": 1, "image_content_type": 1},
+    )
+    if fiche is None or fiche.get("image_id") is None:
+        raise HTTPException(404, "Aucune photo n’est enregistrée pour cet animal.")
+    try:
+        photo = photos_animaux.open_download_stream(fiche["image_id"])
+    except NoFile:
+        raise HTTPException(404, "La photo de cet animal est introuvable.")
+    return Response(
+        content=photo.read(),
+        media_type=fiche.get("image_content_type", "application/octet-stream"),
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 
 @app.get("/troupeau")
