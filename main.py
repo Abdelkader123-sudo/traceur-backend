@@ -79,6 +79,7 @@ positions = base["positions"]
 alerts = base["alerts"]
 etat_animaux = base["etat_animaux"]
 animaux = base["animaux"]                      # fiches des animaux (type, sexe, âge, poids)
+sante_animaux = base["sante_animaux"]
 photos_animaux = GridFSBucket(base, bucket_name="photos_animaux")
 pasture = base["pastures"]
 parametres_col = base["parametres"]
@@ -187,6 +188,15 @@ class InfoAnimal(BaseModel):
 class PhotoAnimal(BaseModel):
     contenu_base64: str = Field(..., max_length=5_600_000)
     type_contenu: Literal["image/jpeg", "image/png", "image/webp"]
+
+
+class EvenementSante(BaseModel):
+    type: Literal["vaccination", "traitement", "consultation", "poids", "note"]
+    titre: str = Field(min_length=1, max_length=100)
+    date: datetime
+    note: str = Field(default="", max_length=1000)
+    prochaine_echeance: Optional[datetime] = None
+    poids_kg: Optional[float] = Field(None, gt=0, le=1500)
 
 
 TAILLE_MAX_PHOTO_ANIMAL = 4 * 1024 * 1024
@@ -1184,6 +1194,47 @@ def lire_photo_animal(animal_id: str, u: dict = Depends(courant)):
         media_type=fiche.get("image_content_type", "application/octet-stream"),
         headers={"Cache-Control": "private, max-age=3600"},
     )
+
+
+@app.get("/animaux/{animal_id}/sante")
+def lire_evenements_sante(animal_id: str, u: dict = Depends(courant)):
+    filtre = {"client_id": u["client_id"], "animal_id": animal_id}
+    evenements = sante_animaux.find(filtre, {"_id": 0, "client_id": 0})
+    resultat = []
+    for evenement in evenements:
+        evenement["id"] = evenement.pop("event_id")
+        resultat.append(evenement)
+    resultat.sort(key=lambda evenement: evenement["date"], reverse=True)
+    return resultat
+
+
+@app.put("/animaux/{animal_id}/sante/{evenement_id}")
+def enregistrer_evenement_sante(
+    animal_id: str,
+    evenement_id: str,
+    evenement: EvenementSante,
+    u: dict = Depends(courant),
+):
+    filtre = {
+        "client_id": u["client_id"],
+        "animal_id": animal_id,
+        "event_id": evenement_id,
+    }
+    donnees = evenement.model_dump()
+    sante_animaux.update_one(
+        filtre,
+        {
+            "$set": {
+                **donnees,
+                "animal_id": animal_id,
+                "event_id": evenement_id,
+                "client_id": u["client_id"],
+                "numero_client": u["numero_client"],
+            }
+        },
+        upsert=True,
+    )
+    return {"id": evenement_id, "animal_id": animal_id, **donnees}
 
 
 @app.get("/troupeau")

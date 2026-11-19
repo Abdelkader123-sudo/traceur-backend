@@ -28,6 +28,7 @@ PAGES_AUTORISEES = (
     "alerts",
     "notifications",
     "animals",
+    "health",
     "history",
     "messages",
     "settings",
@@ -64,14 +65,14 @@ class NouvelUtilisateur(BaseModel):
     telephone: str = Field(min_length=6, max_length=20)
     cin: str = Field(pattern=r"^\d{8}$")
     pages_autorisees: List[Literal[
-        "map", "herds", "alerts", "notifications", "animals", "history",
+        "map", "herds", "alerts", "notifications", "animals", "health", "history",
         "messages", "settings"
     ]]
 
 
 class PermissionsUtilisateur(BaseModel):
     pages_autorisees: List[Literal[
-        "map", "herds", "alerts", "notifications", "animals", "history",
+        "map", "herds", "alerts", "notifications", "animals", "health", "history",
         "messages", "settings"
     ]]
 
