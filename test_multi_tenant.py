@@ -35,12 +35,20 @@ from messagerie import ConversationDirecte, creer_routeur_messagerie
 class CollectionMemoire:
     def __init__(self):
         self.documents = []
+        self.indexes = {}
+        self.indexes_crees = []
+        self.indexes_supprimes = []
 
     def create_index(self, *args, **kwargs):
-        return None
+        self.indexes_crees.append((args, kwargs))
+        return kwargs.get("name", "index_test")
 
     def index_information(self):
-        return {}
+        return dict(self.indexes)
+
+    def drop_index(self, nom):
+        self.indexes_supprimes.append(nom)
+        self.indexes.pop(nom, None)
 
     def _correspond(self, document, filtre):
         for cle, valeur in filtre.items():
@@ -263,6 +271,40 @@ class IsolationClientTests(unittest.TestCase):
 
         self.assertEqual(session["utilisateur"]["id"], str(utilisateur["_id"]))
 
+    def test_meme_mot_de_passe_ouvre_le_compte_de_chaque_ferme(self):
+        base = BaseMemoire()
+        utilisateur_a = {
+            "_id": ObjectId(),
+            "nom": "Alice",
+            "prenom": "A",
+            "role": "utilisateur",
+            "client_id": ObjectId(),
+            "numero_client": "00000001",
+            "mot_de_passe": _hacher("mot-partage"),
+        }
+        utilisateur_b = {
+            "_id": ObjectId(),
+            "nom": "Bob",
+            "prenom": "B",
+            "role": "utilisateur",
+            "client_id": ObjectId(),
+            "numero_client": "00000002",
+            "mot_de_passe": _hacher("mot-partage"),
+        }
+        base["utilisateurs"].insert_one(utilisateur_a)
+        base["utilisateurs"].insert_one(utilisateur_b)
+        connexion = _route(creer_routeur(base), "/auth/connexion", "POST")
+
+        session_a = connexion(
+            Connexion(numero_client="00000001", mot_de_passe="mot-partage")
+        )
+        session_b = connexion(
+            Connexion(numero_client="00000002", mot_de_passe="mot-partage")
+        )
+
+        self.assertEqual(session_a["utilisateur"]["id"], str(utilisateur_a["_id"]))
+        self.assertEqual(session_b["utilisateur"]["id"], str(utilisateur_b["_id"]))
+
     def test_connexion_sans_ferme_ou_nom_est_refusee(self):
         connexion = _route(
             creer_routeur(BaseMemoire()),
@@ -290,14 +332,14 @@ class IsolationClientTests(unittest.TestCase):
                 residence="Rabat",
                 telephone="0612345678",
                 cin="12345678",
-                pages_autorisees=["map", "notifications"],
+                pages_autorisees=["map", "notifications", "health"],
             ),
             u=client,
         )
         self.assertEqual(utilisateur["role"], "utilisateur")
         self.assertEqual(
             utilisateur["pages_autorisees"],
-            ["map", "notifications"],
+            ["map", "notifications", "health"],
         )
         self.assertNotIn("age", utilisateur)
 
@@ -318,19 +360,21 @@ class IsolationClientTests(unittest.TestCase):
             ["map", "alerts", "notifications"],
         )
 
-    def test_cin_unique_entre_clients_et_stocke_sous_forme_de_hachage(self):
+    def test_mot_de_passe_reutilisable_entre_fermes_mais_unique_dans_la_ferme(self):
         base = BaseMemoire()
         creer = _route(creer_routeur(base), "/utilisateurs", "POST")
+        client_a_id = ObjectId()
+        client_b_id = ObjectId()
         client_a = {
             "_id": ObjectId(),
             "role": "superadmin",
-            "client_id": ObjectId(),
+            "client_id": client_a_id,
             "numero_client": "00000001",
         }
         client_b = {
             "_id": ObjectId(),
             "role": "superadmin",
-            "client_id": ObjectId(),
+            "client_id": client_b_id,
             "numero_client": "00000002",
         }
         premier = creer(
@@ -348,28 +392,67 @@ class IsolationClientTests(unittest.TestCase):
         self.assertEqual(enregistre["cin_hash"], _hachage_cin("12345678"))
         self.assertNotIn("cin", enregistre)
 
+        second = creer(
+            NouvelUtilisateur(
+                nom="Bob",
+                prenom="Test",
+                residence="Tunis",
+                telephone="0612345679",
+                cin="12345678",
+                pages_autorisees=["map"],
+            ),
+            u=client_b,
+        )
+        self.assertNotEqual(premier["id"], second["id"])
+        self.assertEqual(
+            base["utilisateurs"].find_one(
+                {"_id": ObjectId(second["id"])}
+            )["cin_hash"],
+            _hachage_cin("12345678"),
+        )
+
         with self.assertRaises(HTTPException) as erreur:
             creer(
                 NouvelUtilisateur(
-                    nom="Bob",
+                    nom="Charlie",
                     prenom="Test",
-                    residence="Tunis",
-                    telephone="0612345679",
+                    residence="Rabat",
+                    telephone="0612345680",
                     cin="12345678",
                     pages_autorisees=["map"],
                 ),
-                u=client_b,
+                u=client_a,
             )
         self.assertEqual(erreur.exception.status_code, 409)
-        self.assertIn("CIN", erreur.exception.detail)
+        self.assertIn("cette ferme", erreur.exception.detail)
+
+    def test_remplace_lindex_global_des_mots_de_passe_par_un_index_par_ferme(self):
+        base = BaseMemoire()
+        users = base["utilisateurs"]
+        users.indexes["cin_hash_1"] = {
+            "key": [("cin_hash", 1)],
+            "unique": True,
+        }
+
+        creer_routeur(base)
+
+        self.assertIn("cin_hash_1", users.indexes_supprimes)
+        index_scoped = next(
+            kwargs
+            for args, kwargs in users.indexes_crees
+            if args[0] == [("client_id", 1), ("cin_hash", 1)]
+        )
+        self.assertTrue(index_scoped["unique"])
 
     def test_cin_deja_present_dans_un_compte_historique_est_reconnu(self):
         base = BaseMemoire()
         users = base["utilisateurs"]
         ancien_id = ObjectId()
+        client_id = ObjectId()
         users.insert_one({
             "_id": ancien_id,
             "role": "utilisateur",
+            "client_id": client_id,
             "mot_de_passe": _hacher("87654321"),
         })
         creer = _route(creer_routeur(base), "/utilisateurs", "POST")
@@ -387,7 +470,7 @@ class IsolationClientTests(unittest.TestCase):
                 u={
                     "_id": ObjectId(),
                     "role": "superadmin",
-                    "client_id": ObjectId(),
+                    "client_id": client_id,
                     "numero_client": "00000001",
                 },
             )

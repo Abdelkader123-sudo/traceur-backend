@@ -116,12 +116,17 @@ def _hachage_jeton(jeton: str) -> str:
     return hashlib.sha256(jeton.encode()).hexdigest()
 
 
-def _cin_deja_utilise(users, cin: str, cin_hash: str) -> bool:
-    if users.find_one({"cin_hash": cin_hash}, {"_id": 1}):
+def _cin_deja_utilise(users, client_id, cin: str, cin_hash: str) -> bool:
+    filtre_client = {"client_id": client_id}
+    if users.find_one(
+        {**filtre_client, "cin_hash": cin_hash},
+        {"_id": 1},
+    ):
         return True
 
     anciens = users.find(
         {
+            **filtre_client,
             "role": {"$ne": "superadmin"},
             "cin_hash": {"$exists": False},
         },
@@ -131,7 +136,11 @@ def _cin_deja_utilise(users, cin: str, cin_hash: str) -> bool:
         empreinte = utilisateur.get("mot_de_passe")
         if isinstance(empreinte, str) and _verifier(cin, empreinte):
             users.update_one(
-                {"_id": utilisateur["_id"], "cin_hash": {"$exists": False}},
+                {
+                    "_id": utilisateur["_id"],
+                    **filtre_client,
+                    "cin_hash": {"$exists": False},
+                },
                 {"$set": {"cin_hash": cin_hash}},
             )
             return True
@@ -244,16 +253,19 @@ def creer_routeur(db) -> APIRouter:
     codes.create_index("code_hash", unique=True)
     codes.create_index("expire_le", expireAfterSeconds=0)
     sessions.create_index("refresh_token_hash", unique=True)
-    users.create_index(
-        "cin_hash",
-        unique=True,
-        partialFilterExpression={"cin_hash": {"$type": "string"}},
-    )
 
     indexes = users.index_information()
+    for nom, index in indexes.items():
+        if index.get("key") == [("cin_hash", 1)]:
+            users.drop_index(nom)
     for nom in ("nom_cle_1_prenom_cle_1", "est_superadmin_1"):
         if nom in indexes:
             users.drop_index(nom)
+    users.create_index(
+        [("client_id", 1), ("cin_hash", 1)],
+        unique=True,
+        partialFilterExpression={"cin_hash": {"$type": "string"}},
+    )
     users.create_index(
         [("client_id", 1), ("nom_cle", 1), ("prenom_cle", 1)],
         unique=True,
@@ -473,8 +485,8 @@ form.addEventListener('submit',async event=>{
         if len(valides) > 1:
             raise HTTPException(
                 409,
-                "Plusieurs comptes utilisent ce mot de passe dans cette ferme. "
-                "Contactez le client pour choisir un mot de passe unique.",
+                "Plusieurs comptes correspondent à ces informations. "
+                "Saisissez la clé de ferme pour distinguer votre compte.",
             )
         raise HTTPException(401, "Numéro client, nom ou mot de passe incorrect.")
 
@@ -611,10 +623,10 @@ form.addEventListener('submit',async event=>{
         if not corps.pages_autorisees:
             raise HTTPException(422, "Sélectionnez au moins une page.")
         cin_hash = _hachage_cin(corps.cin)
-        if _cin_deja_utilise(users, corps.cin, cin_hash):
+        if _cin_deja_utilise(users, u["client_id"], corps.cin, cin_hash):
             raise HTTPException(
                 409,
-                "Ce CIN est déjà utilisé par un autre utilisateur.",
+                "Ce mot de passe est déjà utilisé dans cette ferme.",
             )
         doc = {
             "nom": corps.nom.strip(),
@@ -634,10 +646,13 @@ form.addEventListener('submit',async event=>{
         try:
             doc["_id"] = users.insert_one(doc).inserted_id
         except DuplicateKeyError:
-            if users.find_one({"cin_hash": cin_hash}, {"_id": 1}):
+            if users.find_one(
+                {"client_id": u["client_id"], "cin_hash": cin_hash},
+                {"_id": 1},
+            ):
                 raise HTTPException(
                     409,
-                    "Ce CIN est déjà utilisé par un autre utilisateur.",
+                    "Ce mot de passe est déjà utilisé dans cette ferme.",
                 )
             raise HTTPException(409, "Un utilisateur avec ce nom et ce prénom existe déjà.")
         return _public(doc)
