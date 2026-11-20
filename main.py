@@ -28,6 +28,14 @@ from IA.ia_routes import creer_router, calculer_bilan, SEUIL_HEURES_ALERTE   # A
 from params import BORNES, DEFAUTS, FIXES, valider_parametres
 import trajectoire_service                                   # AJOUT LSTM
 from auth import creer_dependance_courant, creer_routeur     # AJOUT AUTH
+from colliers import (
+    AffectationCollier,
+    affecter_collier,
+    animal_pour_collier,
+    dissocier_collier,
+    enregistrer_signal as enregistrer_signal_collier,
+    lister_colliers,
+)
 from messagerie import creer_routeur_messagerie
 
 MQTT_HOST = os.getenv("MQTT_HOST", "ycf81881.ala.eu-central-1.emqxsl.com")
@@ -79,6 +87,7 @@ positions = base["positions"]
 alerts = base["alerts"]
 etat_animaux = base["etat_animaux"]
 animaux = base["animaux"]                      # fiches des animaux (type, sexe, âge, poids)
+colliers = base["colliers"]
 sante_animaux = base["sante_animaux"]
 photos_animaux = GridFSBucket(base, bucket_name="photos_animaux")
 pasture = base["pastures"]
@@ -165,7 +174,8 @@ def _client_id(valeur):
 
 class Position(BaseModel):
     """Format attendu pour chaque message MQTT."""
-    animal_id: str
+    animal_id: Optional[str] = None
+    collier_id: Optional[str] = None
     lat: float
     lon: float
     vitesse: float
@@ -408,6 +418,21 @@ def creer_index_etat_animaux():
             [("client_id", 1), ("animal_id", 1)], unique=True)
     except Exception as erreur:
         print(f"Index état animaux non créé : {erreur}")
+
+
+def creer_index_colliers():
+    try:
+        colliers.create_index(
+            [("client_id", 1), ("collier_id", 1)],
+            unique=True,
+        )
+        colliers.create_index(
+            [("client_id", 1), ("animal_id", 1)],
+            unique=True,
+            partialFilterExpression={"animal_id": {"$type": "string"}},
+        )
+    except Exception as erreur:
+        print(f"Index colliers non créé : {erreur}")
 
 
 def creer_index_nettoyage():
@@ -660,6 +685,31 @@ def on_connect(client, userdata, flags, reason_code, properties):
         print(f"Échec de connexion : {reason_code}")
 
 
+def _identifiant_collier(data, position):
+    for cle in ("collier_id", "device_id", "imei", "numero_serie", "serial_number"):
+        valeur = data.get(cle)
+        if valeur is None:
+            continue
+        if isinstance(valeur, bool) or not isinstance(valeur, (str, int)):
+            raise ValueError(f"Identifiant de collier invalide ({cle})")
+        identifiant = str(valeur).strip()
+        if identifiant:
+            return identifiant
+    return position.collier_id.strip() if position.collier_id else None
+
+
+def _numero_client_topic(topic):
+    parties = topic.split("/")
+    if (
+        len(parties) == 3
+        and parties[0] == "farm"
+        and parties[2] == "data"
+        and parties[1] not in ("", "+", "#")
+    ):
+        return parties[1].strip()
+    return None
+
+
 def on_message(mqtt_client_instance, userdata, msg):
     try:
         data = json.loads(msg.payload.decode("utf-8"))
@@ -671,7 +721,56 @@ def on_message(mqtt_client_instance, userdata, msg):
     if position.timestamp.tzinfo is None:
         position.timestamp = position.timestamp.replace(tzinfo=timezone.utc)
 
-    if position.numero_client:
+    try:
+        collier_id = _identifiant_collier(data, position)
+    except ValueError as erreur:
+        print(f"Message rejeté sur {msg.topic} : {erreur}")
+        return
+
+    if collier_id:
+        if len(collier_id) > 128:
+            print(f"Message rejeté sur {msg.topic} : identifiant de collier trop long")
+            return
+        numero_client = (
+            position.numero_client.strip()
+            if position.numero_client and position.numero_client.strip()
+            else _numero_client_topic(msg.topic)
+        )
+        if not numero_client:
+            print(f"Message rejeté sur {msg.topic} : numéro client manquant pour le collier")
+            return
+        client_doc = clients_col.find_one({"numero_client": numero_client})
+        if client_doc is None:
+            print(f"Message rejeté : numéro client inconnu ({numero_client})")
+            return
+        position = position.model_copy(update={"collier_id": collier_id})
+        enregistrer_signal_collier(colliers, client_doc, collier_id, position)
+        animal_id = animal_pour_collier(
+            colliers,
+            client_doc["_id"],
+            collier_id,
+            position.timestamp,
+        )
+        if not animal_id:
+            print(f"Collier détecté sans affectation : {collier_id}")
+            return
+        animal = animaux.find_one({
+            "client_id": client_doc["_id"],
+            "animal_id": animal_id,
+        })
+        if animal is None:
+            print(f"Message rejeté : animal introuvable pour le collier {collier_id}")
+            return
+        ferme = animal.get("ferme") or "Ferme principale"
+        position = position.model_copy(update={
+            "animal_id": animal_id,
+            "numero_client": client_doc["numero_client"],
+            "ferme": ferme,
+        })
+    elif position.numero_client:
+        if not position.animal_id:
+            print(f"Message rejeté sur {msg.topic} : animal_id manquant")
+            return
         client_doc = clients_col.find_one({"numero_client": position.numero_client.strip()})
         if client_doc is None:
             print(f"Message rejeté : numéro client inconnu ({position.numero_client})")
@@ -691,7 +790,7 @@ def on_message(mqtt_client_instance, userdata, msg):
             })
         else:
             ferme = animal.get("ferme") or ferme
-    else:
+    elif position.animal_id:
         proprietaires = list(animaux.find(
             {"animal_id": position.animal_id},
             {"client_id": 1, "numero_client": 1, "ferme": 1},
@@ -705,6 +804,9 @@ def on_message(mqtt_client_instance, userdata, msg):
             print(f"Message rejeté : client introuvable pour {position.animal_id}")
             return
         ferme = animal.get("ferme", "Ferme principale")
+    else:
+        print(f"Message rejeté sur {msg.topic} : animal_id ou identifiant de collier manquant")
+        return
 
     position = position.model_copy(update={
         "client_id": str(client_doc["_id"]),
@@ -725,6 +827,7 @@ def on_message(mqtt_client_instance, userdata, msg):
             mesures_activite.insert_one({
                 "animal_id": position.animal_id, "timestamp": position.timestamp,
                 "client_id": client_doc["_id"], "numero_client": client_doc["numero_client"],
+                "collier_id": position.collier_id,
                 "mi": float(data["mi"]), "steps": float(data["steps"]),
                 "duree_s": float(data["duree_s"]) if data.get("duree_s") is not None else None})
         except Exception as erreur:
@@ -763,6 +866,7 @@ async def lifespan(app: FastAPI):
         creer_index_etat_animaux
     )
     await asyncio.to_thread(creer_index_animaux)        # AJOUT FICHES ANIMAUX (sans bloquer le démarrage)
+    await asyncio.to_thread(creer_index_colliers)
     await asyncio.to_thread(
         mesures_activite.create_index, [("animal_id", 1), ("timestamp", -1)]
     )      # AJOUT IA
@@ -1072,6 +1176,31 @@ def lancer_nettoyage(u: dict = Depends(courant)):
     """Exécute nettoyer_base() immédiatement et renvoie le nombre de documents
     supprimés par collection."""
     return nettoyer_base(u["client_id"])
+
+
+# ---------------------------------------------------------------------------
+# Gestion des colliers et de leurs affectations horodatées
+# ---------------------------------------------------------------------------
+@app.get("/colliers")
+def lire_colliers(u: dict = Depends(courant)):
+    return lister_colliers(colliers, u)
+
+
+@app.put("/colliers/{collier_id}/affectation")
+def enregistrer_affectation_collier(
+    collier_id: str,
+    demande: AffectationCollier,
+    u: dict = Depends(courant),
+):
+    return affecter_collier(colliers, animaux, collier_id, demande, u)
+
+
+@app.delete("/colliers/{collier_id}/affectation")
+def supprimer_affectation_collier(
+    collier_id: str,
+    u: dict = Depends(courant),
+):
+    return dissocier_collier(colliers, collier_id, u)
 
 
 # ---------------------------------------------------------------------------
