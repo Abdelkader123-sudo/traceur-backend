@@ -37,6 +37,7 @@ from colliers import (
     lister_colliers,
 )
 from messagerie import creer_routeur_messagerie
+from temps_travail import creer_routeur_temps_travail
 
 MQTT_HOST = os.getenv("MQTT_HOST", "ycf81881.ala.eu-central-1.emqxsl.com")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
@@ -906,6 +907,7 @@ app.include_router(creer_router(mesures_activite, appliquer_alerte_ia,
 # AJOUT AUTH : /auth/etat, /auth/inscription, /auth/connexion, /auth/moi, /utilisateurs
 app.include_router(creer_routeur(base))
 app.include_router(creer_routeur_messagerie(base))
+app.include_router(creer_routeur_temps_travail(base))
 
 
 # ---------------------------------------------------------------------------
