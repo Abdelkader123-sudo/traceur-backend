@@ -30,8 +30,10 @@ PAGES_AUTORISEES = (
     "animals",
     "health",
     "history",
+    "worktime",
     "messages",
     "settings",
+    "animal_sales",
 )
 
 
@@ -66,14 +68,14 @@ class NouvelUtilisateur(BaseModel):
     cin: str = Field(pattern=r"^\d{8}$")
     pages_autorisees: List[Literal[
         "map", "herds", "alerts", "notifications", "animals", "health", "history",
-        "messages", "settings"
+        "worktime", "messages", "settings", "animal_sales"
     ]]
 
 
 class PermissionsUtilisateur(BaseModel):
     pages_autorisees: List[Literal[
         "map", "herds", "alerts", "notifications", "animals", "health", "history",
-        "messages", "settings"
+        "worktime", "messages", "settings", "animal_sales"
     ]]
 
 
