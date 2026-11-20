@@ -34,6 +34,10 @@ class InstallationFCM(BaseModel):
     identifiant: str = Field(min_length=1, max_length=256)
 
 
+class ModifierTelephoneAnnuaire(BaseModel):
+    telephone: str = Field(max_length=20)
+
+
 def _object_id(valeur: str) -> ObjectId:
     if not ObjectId.is_valid(valeur):
         raise HTTPException(status_code=400, detail="Identifiant utilisateur invalide.")
@@ -45,7 +49,22 @@ def _utilisateur_public(utilisateur: dict) -> dict:
         "id": str(utilisateur["_id"]),
         "nom": utilisateur.get("nom", ""),
         "prenom": utilisateur.get("prenom", ""),
-        "role": utilisateur.get("role", "utilisateur"),
+        "role": (
+            "client"
+            if utilisateur.get("role") == "superadmin"
+            else "utilisateur"
+            if utilisateur.get("role") == "admin"
+            else utilisateur.get("role", "utilisateur")
+        ),
+    }
+
+
+def _contact_annuaire_public(utilisateur: dict) -> dict:
+    return {
+        "id": str(utilisateur["_id"]),
+        "nom": utilisateur.get("nom", ""),
+        "prenom": utilisateur.get("prenom", ""),
+        "telephone": utilisateur.get("telephone", "").strip(),
     }
 
 
@@ -63,6 +82,7 @@ def _message_public(message: Optional[dict]) -> Optional[dict]:
 
 def creer_routeur_messagerie(db):
     users = db["utilisateurs"]
+    clients = db["clients"]
     conversations = db["conversations"]
     messages = db["messages"]
     conversations.create_index(
@@ -130,6 +150,48 @@ def creer_routeur_messagerie(db):
                 "client_id": utilisateur["client_id"],
             })
         ]
+
+    @router.get("/annuaire")
+    def lister_annuaire(utilisateur: dict = Depends(courant)):
+        contacts = [
+            _contact_annuaire_public(autre)
+            for autre in users.find({
+                "client_id": utilisateur["client_id"],
+            }).sort([("nom_cle", 1), ("prenom_cle", 1)])
+            if isinstance(autre.get("telephone"), str)
+            and autre["telephone"].strip()
+        ]
+        return {"contacts": contacts}
+
+    @router.patch("/annuaire/telephone")
+    def modifier_telephone_annuaire(
+        corps: ModifierTelephoneAnnuaire,
+        utilisateur: dict = Depends(courant),
+    ):
+        telephone = corps.telephone.strip()
+        if telephone and (
+            sum(caractere.isdigit() for caractere in telephone) < 6
+            or any(
+                not caractere.isdigit() and caractere not in "+ "
+                for caractere in telephone
+            )
+        ):
+            raise HTTPException(422, "Numéro de téléphone invalide.")
+
+        filtre = {
+            "_id": utilisateur["_id"],
+            "client_id": utilisateur["client_id"],
+        }
+        if not users.find_one(filtre):
+            raise HTTPException(404, "Utilisateur introuvable.")
+
+        users.update_one(filtre, {"$set": {"telephone": telephone}})
+        if utilisateur.get("role") == "superadmin":
+            clients.update_one(
+                {"_id": utilisateur["client_id"]},
+                {"$set": {"telephone": telephone}},
+            )
+        return {"telephone": telephone}
 
     @router.post("/installation-fcm", status_code=204)
     def enregistrer_installation_fcm(
