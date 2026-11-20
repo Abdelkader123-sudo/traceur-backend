@@ -49,6 +49,8 @@ def _rejouer(evenements: list[dict]) -> dict:
         "taches_du_jour": [],
         "evenements_locaux_appliques": [],
     }
+    journees_terminees = set()
+    taches_terminees = set()
     ordre = sorted(
         evenements,
         key=lambda evenement: (
@@ -66,7 +68,44 @@ def _rejouer(evenements: list[dict]) -> dict:
 
         if type_evenement == "journee_debut":
             if journee is not None:
-                raise HTTPException(409, "Une journée de travail est déjà active.")
+                if journee["journee_id"] == journee_id:
+                    etat["evenements_locaux_appliques"].append(
+                        evenement["evenement_id"]
+                    )
+                    continue
+                if tache is not None:
+                    debut_tache = datetime.fromisoformat(tache["debut_utc"])
+                    if instant < debut_tache:
+                        raise HTTPException(409, "Le début de journée est invalide.")
+                    etat["taches_du_jour"].append(
+                        {
+                            "tache_id": tache["tache_id"],
+                            "nom": tache["nom"],
+                            "debut_utc": tache["debut_utc"],
+                            "fin_utc": _iso(instant),
+                            "duree_secondes": int(
+                                (instant - debut_tache).total_seconds()
+                            ),
+                        }
+                    )
+                    taches_terminees.add(tache["tache_id"])
+                    etat["tache_active"] = None
+                debut_journee = datetime.fromisoformat(journee["debut_utc"])
+                if instant < debut_journee:
+                    raise HTTPException(409, "Le début de journée est invalide.")
+                etat["journees_du_jour"].append(
+                    {
+                        "journee_id": journee["journee_id"],
+                        "debut_utc": journee["debut_utc"],
+                        "fin_utc": _iso(instant),
+                        "date_locale": journee["date_locale"],
+                        "duree_secondes": int(
+                            (instant - debut_journee).total_seconds()
+                        ),
+                    }
+                )
+                journees_terminees.add(journee["journee_id"])
+                etat["journee_active"] = None
             etat["journee_active"] = {
                 "journee_id": journee_id,
                 "debut_utc": _iso(instant),
@@ -74,10 +113,31 @@ def _rejouer(evenements: list[dict]) -> dict:
                 "decalage_minutes": evenement["decalage_minutes"],
             }
         elif type_evenement == "tache_debut":
+            if tache is not None:
+                if tache["tache_id"] == evenement.get("tache_id"):
+                    etat["evenements_locaux_appliques"].append(
+                        evenement["evenement_id"]
+                    )
+                    continue
+                debut_tache = datetime.fromisoformat(tache["debut_utc"])
+                if instant < debut_tache:
+                    raise HTTPException(409, "Le début de tâche est invalide.")
+                etat["taches_du_jour"].append(
+                    {
+                        "tache_id": tache["tache_id"],
+                        "nom": tache["nom"],
+                        "debut_utc": tache["debut_utc"],
+                        "fin_utc": _iso(instant),
+                        "duree_secondes": int(
+                            (instant - debut_tache).total_seconds()
+                        ),
+                    }
+                )
+                taches_terminees.add(tache["tache_id"])
+                etat["tache_active"] = None
             if (
                 journee is None
                 or journee["journee_id"] != journee_id
-                or tache is not None
                 or instant < datetime.fromisoformat(journee["debut_utc"])
             ):
                 raise HTTPException(409, "Le début de tâche ne correspond pas.")
@@ -95,6 +155,11 @@ def _rejouer(evenements: list[dict]) -> dict:
                 or tache["tache_id"] != evenement.get("tache_id")
                 or instant < datetime.fromisoformat(tache["debut_utc"])
             ):
+                if evenement.get("tache_id") in taches_terminees:
+                    etat["evenements_locaux_appliques"].append(
+                        evenement["evenement_id"]
+                    )
+                    continue
                 raise HTTPException(409, "La fin de tâche ne correspond pas.")
             debut_tache = datetime.fromisoformat(tache["debut_utc"])
             etat["taches_du_jour"].append(
@@ -106,16 +171,39 @@ def _rejouer(evenements: list[dict]) -> dict:
                     "duree_secondes": int((instant - debut_tache).total_seconds()),
                 }
             )
+            taches_terminees.add(tache["tache_id"])
             etat["tache_active"] = None
         elif type_evenement == "journee_fin":
             if (
                 journee is None
                 or journee["journee_id"] != journee_id
-                or tache is not None
-                or instant < datetime.fromisoformat(journee["debut_utc"])
             ):
+                if journee_id in journees_terminees:
+                    etat["evenements_locaux_appliques"].append(
+                        evenement["evenement_id"]
+                    )
+                    continue
                 raise HTTPException(409, "La fin de journée ne correspond pas.")
+            if tache is not None:
+                debut_tache = datetime.fromisoformat(tache["debut_utc"])
+                if instant < debut_tache:
+                    raise HTTPException(409, "La fin de journée est invalide.")
+                etat["taches_du_jour"].append(
+                    {
+                        "tache_id": tache["tache_id"],
+                        "nom": tache["nom"],
+                        "debut_utc": tache["debut_utc"],
+                        "fin_utc": _iso(instant),
+                        "duree_secondes": int(
+                            (instant - debut_tache).total_seconds()
+                        ),
+                    }
+                )
+                taches_terminees.add(tache["tache_id"])
+                etat["tache_active"] = None
             debut_journee = datetime.fromisoformat(journee["debut_utc"])
+            if instant < debut_journee:
+                raise HTTPException(409, "La fin de journée ne correspond pas.")
             etat["journees_du_jour"].append(
                 {
                     "journee_id": journee_id,
@@ -127,6 +215,7 @@ def _rejouer(evenements: list[dict]) -> dict:
                     ),
                 }
             )
+            journees_terminees.add(journee_id)
             etat["journee_active"] = None
         etat["evenements_locaux_appliques"].append(evenement["evenement_id"])
     return etat
