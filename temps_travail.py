@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta, timezone
+import math
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -19,6 +20,20 @@ class EvenementTravail(BaseModel):
     decalage_minutes: int = Field(ge=-840, le=840)
 
 
+class RapportPresence(BaseModel):
+    journee_id: str = Field(min_length=1, max_length=128)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    precision_m: float = Field(gt=0, le=10000)
+    est_simulee: bool = False
+
+
+class ZoneTravail(BaseModel):
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    rayon_m: int = Field(ge=30, le=5000)
+
+
 def _utc(instant: datetime) -> datetime:
     if instant.tzinfo is None:
         return instant.replace(tzinfo=timezone.utc)
@@ -27,6 +42,19 @@ def _utc(instant: datetime) -> datetime:
 
 def _iso(instant: datetime) -> str:
     return _utc(instant).isoformat()
+
+
+def _distance_metres(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    rayon_terre = 6_371_000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    a = (
+        math.sin(delta_phi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+    )
+    a = min(1.0, max(0.0, a))
+    return 2 * rayon_terre * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def _valider_evenement(evenement: dict):
@@ -271,6 +299,8 @@ def _statistique_jour(
 def creer_routeur_temps_travail(db):
     users = db["utilisateurs"]
     evenements_col = db["temps_travail_evenements"]
+    presence_col = db["temps_travail_presence"]
+    zones_col = db["temps_travail_zones"]
     evenements_col.create_index(
         [("client_id", 1), ("utilisateur_id", 1), ("evenement_id", 1)],
         unique=True,
@@ -280,12 +310,58 @@ def creer_routeur_temps_travail(db):
         [("client_id", 1), ("date_locale", 1), ("utilisateur_id", 1)],
         name="temps_travail_par_jour",
     )
+    presence_col.create_index(
+        [("client_id", 1), ("utilisateur_id", 1)],
+        unique=True,
+        name="temps_travail_presence_unique",
+    )
+    presence_col.create_index(
+        "recu_le_utc",
+        expireAfterSeconds=24 * 60 * 60,
+        name="temps_travail_presence_expiration",
+    )
+    zones_col.create_index(
+        [("client_id", 1)],
+        unique=True,
+        name="temps_travail_zone_unique",
+    )
 
     router = APIRouter(tags=["temps-travail"])
     courant = creer_dependance_courant(
         users,
         db["sessions_authentification"],
     )
+
+    def _etat_courant(utilisateur: dict) -> dict:
+        documents = list(
+            evenements_col.find(
+                {
+                    "client_id": utilisateur["client_id"],
+                    "utilisateur_id": utilisateur["_id"],
+                }
+            )
+        )
+        if not documents:
+            return _rejouer([])
+        dernier = max(
+            documents,
+            key=lambda evenement: _utc(evenement["horodatage_utc"]),
+        )
+        decalage = dernier["decalage_minutes"]
+        aujourd_hui = (
+            datetime.now(timezone.utc) + timedelta(minutes=decalage)
+        ).date().isoformat()
+        return _rejouer(
+            [
+                evenement
+                for evenement in documents
+                if evenement["date_locale"] == aujourd_hui
+            ]
+        )
+
+    def _verifier_proprietaire(utilisateur: dict):
+        if utilisateur.get("role") != "superadmin":
+            raise HTTPException(403, "Réservé au client propriétaire.")
 
     @router.post("/temps-travail/evenements")
     def enregistrer_evenement(
@@ -304,6 +380,13 @@ def creer_routeur_temps_travail(db):
         if existant:
             if any(existant.get(cle) != valeur for cle, valeur in evenement.items()):
                 raise HTTPException(409, "Identifiant d’événement déjà utilisé.")
+            if corps.type == "journee_fin":
+                presence_col.delete_one(
+                    {
+                        "client_id": utilisateur["client_id"],
+                        "utilisateur_id": utilisateur["_id"],
+                    }
+                )
             return {"evenement_id": corps.evenement_id}
 
         journees_existantes = list(
@@ -331,6 +414,13 @@ def creer_routeur_temps_travail(db):
                 existant.get(cle) != valeur for cle, valeur in evenement.items()
             ):
                 raise HTTPException(409, "Identifiant d’événement déjà utilisé.")
+        if corps.type == "journee_fin":
+            presence_col.delete_one(
+                {
+                    "client_id": utilisateur["client_id"],
+                    "utilisateur_id": utilisateur["_id"],
+                }
+            )
         return {"evenement_id": corps.evenement_id}
 
     @router.get("/temps-travail/etat")
@@ -436,4 +526,211 @@ def creer_routeur_temps_travail(db):
             )
         return {"utilisateurs": utilisateurs}
 
+    @router.get("/temps-travail/presence/configuration")
+    def configuration_presence(utilisateur: dict = Depends(courant)):
+        zone = zones_col.find_one({"client_id": utilisateur["client_id"]})
+        return {
+            "zone_configuree": zone is not None,
+            "intervalle_secondes": INTERVALLE_PRESENCE_SECONDES,
+        }
+
+    @router.put("/admin/temps-travail/presence/zone")
+    def definir_zone_travail(
+        corps: ZoneTravail,
+        utilisateur: dict = Depends(courant),
+    ):
+        _verifier_proprietaire(utilisateur)
+        zone = {
+            **corps.model_dump(),
+            "client_id": utilisateur["client_id"],
+            "mis_a_jour_utc": datetime.now(timezone.utc),
+        }
+        zones_col.update_one(
+            {"client_id": utilisateur["client_id"]},
+            {"$set": zone},
+            upsert=True,
+        )
+        return {
+            "latitude": corps.latitude,
+            "longitude": corps.longitude,
+            "rayon_m": corps.rayon_m,
+        }
+
+    @router.post("/temps-travail/presence")
+    def enregistrer_presence(
+        corps: RapportPresence,
+        utilisateur: dict = Depends(courant),
+    ):
+        etat = _etat_courant(utilisateur)
+        journee = etat["journee_active"]
+        if journee is None or journee["journee_id"] != corps.journee_id:
+            raise HTTPException(
+                409,
+                "Aucune journée de travail correspondante n’est active.",
+            )
+
+        zone = zones_col.find_one({"client_id": utilisateur["client_id"]})
+        if zone is None:
+            raise HTTPException(
+                409,
+                "Le propriétaire n’a pas encore défini la zone de travail.",
+            )
+
+        precision_fiable = (
+            0 < corps.precision_m <= MAX_PRECISION_PRESENCE_METRES
+        )
+        dans_ferme = None
+        if precision_fiable and not corps.est_simulee:
+            distance = _distance_metres(
+                corps.latitude,
+                corps.longitude,
+                zone["latitude"],
+                zone["longitude"],
+            )
+            borne_interieure = max(0, distance - corps.precision_m)
+            borne_exterieure = distance + corps.precision_m
+            if borne_exterieure <= zone["rayon_m"]:
+                dans_ferme = True
+            elif borne_interieure > zone["rayon_m"]:
+                dans_ferme = False
+
+        recu = datetime.now(timezone.utc)
+        presence_col.update_one(
+            {
+                "client_id": utilisateur["client_id"],
+                "utilisateur_id": utilisateur["_id"],
+            },
+            {
+                "$set": {
+                    "client_id": utilisateur["client_id"],
+                    "utilisateur_id": utilisateur["_id"],
+                    "journee_id": corps.journee_id,
+                    "recu_le_utc": recu,
+                    "precision_fiable": precision_fiable,
+                    "est_simulee": corps.est_simulee,
+                    "dans_ferme": dans_ferme,
+                }
+            },
+            upsert=True,
+        )
+        return {
+            "recu_le_utc": _iso(recu),
+            "presence_verifiable": dans_ferme is not None,
+            "dans_ferme": dans_ferme,
+        }
+
+    @router.get("/admin/temps-travail/presence")
+    def presences_admin(utilisateur: dict = Depends(courant)):
+        _verifier_proprietaire(utilisateur)
+        client_id = utilisateur["client_id"]
+        zone = zones_col.find_one({"client_id": client_id})
+        membres = list(
+            users.find(
+                {
+                    "client_id": client_id,
+                    "role": {"$ne": "superadmin"},
+                }
+            )
+        )
+        maintenant = datetime.now(timezone.utc)
+        utilisateurs = []
+        for membre in membres:
+            etat = _etat_courant(membre)
+            journee = etat["journee_active"]
+            presence = presence_col.find_one(
+                {
+                    "client_id": client_id,
+                    "utilisateur_id": membre["_id"],
+                }
+            )
+            derniere_verification = (
+                presence.get("recu_le_utc") if presence else None
+            )
+            presence_recente = (
+                derniere_verification is not None
+                and timedelta(0)
+                <= maintenant - _utc(derniere_verification)
+                <= AGE_MAX_PRESENCE
+                and journee is not None
+                and presence.get("journee_id") == journee["journee_id"]
+                and (
+                    zone is None
+                    or _utc(derniere_verification)
+                    >= _utc(zone["mis_a_jour_utc"])
+                )
+            )
+            precision_fiable = bool(
+                presence
+                and presence.get("precision_fiable")
+                and not presence.get("est_simulee")
+            )
+            verifiee = bool(
+                zone
+                and presence_recente
+                and precision_fiable
+                and presence.get("dans_ferme") is not None
+            )
+            if zone is None:
+                statut = "zone_non_configuree"
+            elif journee is None:
+                statut = "hors_service"
+            elif not presence_recente:
+                statut = "non_verifiee"
+            elif presence and presence.get("est_simulee"):
+                statut = "non_verifiee"
+            elif not precision_fiable:
+                statut = "precision_insuffisante"
+            elif presence.get("dans_ferme") is True:
+                statut = "dans_ferme"
+            elif presence.get("dans_ferme") is False:
+                statut = "hors_ferme"
+            else:
+                statut = "precision_insuffisante"
+
+            nom = " ".join(
+                partie
+                for partie in (
+                    membre.get("prenom", "").strip(),
+                    membre.get("nom", "").strip(),
+                )
+                if partie
+            )
+            utilisateurs.append(
+                {
+                    "utilisateur_id": str(membre["_id"]),
+                    "nom": nom,
+                    "journee_active": journee is not None,
+                    "tache_active": (
+                        etat["tache_active"]["nom"]
+                        if etat["tache_active"]
+                        else None
+                    ),
+                    "statut": statut,
+                    "presence_verifiee": verifiee,
+                    "derniere_verification_utc": (
+                        _iso(derniere_verification)
+                        if derniere_verification is not None
+                        else None
+                    ),
+                }
+            )
+        utilisateurs.sort(key=lambda personne: personne["nom"].lower())
+        return {
+            "zone": (
+                {
+                    "latitude": zone["latitude"],
+                    "longitude": zone["longitude"],
+                    "rayon_m": zone["rayon_m"],
+                }
+                if zone
+                else None
+            ),
+            "utilisateurs": utilisateurs,
+        }
+
     return router
+
+
+INTERVALLE_PRESENCE_SECONDES = 10 * 60
+AGE_MAX_PRESENCE = timedelta(minutes=20)
+MAX_PRECISION_PRESENCE_METRES = 100
