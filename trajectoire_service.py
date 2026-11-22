@@ -1,19 +1,19 @@
 """Alerte « mouvement agité » (LSTM de trajectoire) pour le backend FastAPI.
 
-Principe : à chaque cycle (l'intervalle est fixé dans main.py, variable LSTM_INTERVALLE_S), pour chaque animal,
-on évalue TOUTES les nouvelles positions, dans l'ordre. L'alerte s'ouvre quand l'erreur de prédiction dépasse
-le seuil sur K positions CONSÉCUTIVES.
-L'état (série en cours, dernière position évaluée) est gardé dans MongoDB entre deux exécutions.
+Principe : à chaque cycle (intervalle fixé dans main.py), le backend reconstruit les
+centres du plus grand groupe actif de « Ferme principale », puis applique le modèle
+ONNX existant à cette trajectoire, sans le réentraîner. L'état est unique par client
+et conservé dans MongoDB.
+L'alerte s'ouvre quand l'erreur dépasse le seuil sur K positions consécutives.
 
-MODE_SILENCIEUX = True : les alertes sont enregistrées à part, sans notifier l'utilisateur (à garder pendant la
-phase de recalibrage avec les vraies données du collier).
+MODE_SILENCIEUX = True : les alertes sont enregistrées à part, sans notifier l'utilisateur.
 
 Réglages par variables d'environnement (tous facultatifs) :
     LSTM_K            positions suspectes consécutives avant alerte      (défaut 1)
     LSTM_HISTORIQUE_H heures de positions relues à chaque cycle          (défaut 6)
-    LSTM_ADAPTATIF    "true" = seuil propre à chaque animal              (défaut false)
+    LSTM_ADAPTATIF    "true" = seuil propre à la trajectoire             (défaut false)
     LSTM_PLANCHER_M   seuil minimal en mètres si adaptatif               (défaut 70)
-    LSTM_FACTEUR      seuil = facteur × erreur typique de l'animal       (défaut 4)
+    LSTM_FACTEUR      seuil = facteur × erreur typique de la trajectoire (défaut 4)
 
 Dépendances : numpy, onnxruntime, pymongo (déjà présent), tzdata (pip install tzdata) pour le fuseau Africa/Tunis.
 Fichiers à déployer à côté de ce module : trajectoire.onnx (UN seul fichier) et trajectoire_meta.json.
@@ -22,10 +22,11 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from itertools import groupby
 from zoneinfo import ZoneInfo
 
 import numpy as np
+
+from DBSCAN import analyser_troupeaux
 
 log = logging.getLogger("trajectoire")
 
@@ -36,13 +37,15 @@ FICHIER_META = os.path.join(DOSSIER, "trajectoire_meta.json")
 
 N = 12                  # déplacements d'historique (identique à l'entraînement)
 DT_MAX = 900            # s : au-delà, la série est coupée (identique à l'entraînement)
+ID_TROUPEAU_PRINCIPAL = "troupeau_principal"
+FERME_PRINCIPALE = "Ferme principale"
 K = int(os.getenv("LSTM_K", "1"))                          # positions consécutives au-dessus du seuil
 MODE_SILENCIEUX = True
 HISTORIQUE_H = int(os.getenv("LSTM_HISTORIQUE_H", "6"))    # heures de positions relues à chaque cycle
-RATTRAPAGE_MIN = 60     # au tout premier cycle d'un animal : on n'évalue que la dernière heure
+RATTRAPAGE_MIN = 60     # au premier cycle : on n'évalue que la dernière heure
 TZ_LOCAL = ZoneInfo("Africa/Tunis")   # le modèle utilise l'heure LOCALE (sinus/cosinus de l'heure)
 
-# Seuil adaptatif : seuil de l'animal = min(seuil du modèle, max(plancher, facteur × erreur typique de l'animal))
+# Seuil adaptatif : seuil de trajectoire = min(seuil du modèle, max(plancher, facteur × erreur typique))
 ADAPTATIF = os.getenv("LSTM_ADAPTATIF", "false").lower() == "true"   # éteint par défaut
 PLANCHER_M = float(os.getenv("LSTM_PLANCHER_M", "70"))               # seuil minimal (m)
 FACTEUR = float(os.getenv("LSTM_FACTEUR", "4"))                      # multiple de l'erreur typique
@@ -67,6 +70,7 @@ class Modele:
         if int(meta.get("N", N)) != N:
             raise ValueError("N du modèle différent de N du service")
         self.s_xy, self.s_dt, self.seuil = float(meta["s_xy"]), float(meta["s_dt"]), float(meta["seuil_m"])
+        self.intervalle_s = int(meta.get("intervalle_s", 300))
         options = ort.SessionOptions()
         options.log_severity_level = 3          # n'affiche que les erreurs (pas les avertissements de forme)
         self.session = ort.InferenceSession(fichier_onnx, sess_options=options, providers=["CPUExecutionProvider"])
@@ -137,7 +141,7 @@ def fenetres(F):
 
 # ----------------------------------------------------------------------------- seuil adaptatif
 def seuil_adaptatif(erreurs, seuil_max):
-    """Seuil propre à l'animal : max(plancher, facteur × médiane de ses erreurs), plafonné au seuil du modèle.
+    """Seuil propre à la trajectoire : max(plancher, facteur × médiane des erreurs), plafonné au modèle.
 
     Si l'option est éteinte ou s'il y a moins de 5 erreurs, on garde le seuil du modèle."""
     if not ADAPTATIF or len(erreurs) < 5:
@@ -148,7 +152,7 @@ def seuil_adaptatif(erreurs, seuil_max):
 
 # ----------------------------------------------------------------------------- logique d'alerte (sans base de données)
 def evaluer_animal(positions, etat, predire, seuil, k=K):
-    """Évalue les nouvelles positions d'UN animal.
+    """Évalue les nouveaux points d'une trajectoire.
 
     positions : positions récentes (au moins ~14 avant la première nouvelle), dicts timestamp/lat/lon.
     etat      : {'derniere_cible': instant local|None, 'serie': int} ou None au tout premier cycle.
@@ -171,7 +175,7 @@ def evaluer_animal(positions, etat, predire, seuil, k=K):
     previsions = predire(X)
     toutes = np.linalg.norm(previsions - Y, axis=1)     # erreurs de toutes les fenêtres (estime l'erreur typique)
     erreurs = toutes[garder]
-    seuil = seuil_adaptatif(toutes, seuil)              # seuil propre à cet animal (= seuil du modèle si éteint)
+    seuil = seuil_adaptatif(toutes, seuil)              # seuil propre à la trajectoire (= seuil modèle si éteint)
 
     serie, prec, alertes = int(etat.get("serie", 0)), derniere, []
     for e, j in zip(erreurs, garder):
@@ -195,55 +199,173 @@ def evaluer_animal(positions, etat, predire, seuil, k=K):
     return {"derniere_cible": prec, "serie": serie}, alertes
 
 
+def construire_centres_troupeau(
+    positions,
+    maintenant,
+    parametres,
+    intervalle_s=300,
+    historique_h=HISTORIQUE_H,
+):
+    """Construit les centres réguliers du plus grand groupe de la ferme principale."""
+    if intervalle_s <= 0:
+        raise ValueError("L'intervalle de trajectoire doit être positif.")
+
+    maintenant = (
+        maintenant.replace(tzinfo=timezone.utc)
+        if maintenant.tzinfo is None
+        else maintenant.astimezone(timezone.utc)
+    )
+    intervalle_s = int(intervalle_s)
+    fraicheur_s = int(parametres.get("fraicheur_s", 600))
+    debut = int((maintenant - timedelta(hours=historique_h)).timestamp())
+    premier_pas = debut - debut % intervalle_s
+    dernier_pas = int(maintenant.timestamp())
+    dernier_pas -= dernier_pas % intervalle_s
+
+    ordonnees = []
+    for position in positions:
+        if (
+            position.get("ferme") != FERME_PRINCIPALE
+            or not position.get(CHAMP_ANIMAL)
+            or position.get(CHAMP_TEMPS) is None
+            or position.get(CHAMP_LAT) is None
+            or position.get(CHAMP_LON) is None
+        ):
+            continue
+        instant = position[CHAMP_TEMPS]
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=timezone.utc)
+        else:
+            instant = instant.astimezone(timezone.utc)
+        ordonnees.append((instant, position))
+    ordonnees.sort(key=lambda element: element[0])
+
+    dernier_par_animal = {}
+    index = 0
+    signature_precedente = None
+    centres = []
+    pas = premier_pas
+    while pas <= dernier_pas:
+        instant_pas = datetime.fromtimestamp(pas, timezone.utc)
+        while index < len(ordonnees) and ordonnees[index][0] <= instant_pas:
+            instant, position = ordonnees[index]
+            dernier_par_animal[position[CHAMP_ANIMAL]] = (instant, position)
+            index += 1
+
+        actifs = [
+            {
+                "animal_id": animal_id,
+                "lat": float(position[CHAMP_LAT]),
+                "lon": float(position[CHAMP_LON]),
+            }
+            for animal_id, (instant, position) in dernier_par_animal.items()
+            if 0 <= (instant_pas - instant).total_seconds() <= fraicheur_s
+        ]
+        signature = tuple(sorted(
+            (point["animal_id"], dernier_par_animal[point["animal_id"]][0])
+            for point in actifs
+        ))
+
+        if (
+            len(actifs) >= int(parametres["min_animaux_troupeau"])
+            and signature != signature_precedente
+        ):
+            principal, _, _ = analyser_troupeaux(actifs, parametres)
+            if principal is not None:
+                centres.append({
+                    "timestamp": instant_pas,
+                    "lat": principal["centre_lat"],
+                    "lon": principal["centre_lon"],
+                    "nb_animaux": principal["nb_animaux"],
+                })
+        signature_precedente = signature if actifs else None
+        pas += intervalle_s
+    return centres
+
+
 # ----------------------------------------------------------------------------- cycle complet (MongoDB, pymongo synchrone)
-def executer_cycle(db, predire=None, seuil=None, client_id=None):
-    """À appeler à intervalle régulier. `db` = base pymongo. Retourne un petit bilan."""
+def executer_cycle(db, predire=None, seuil=None, client_id=None, parametres=None, maintenant=None):
+    """Évalue une trajectoire pour le centre du plus grand groupe de la ferme principale."""
     modele = predire or charger_modele()
     seuil = seuil if seuil is not None else modele.seuil
-    depuis = datetime.now(timezone.utc) - timedelta(hours=HISTORIQUE_H)
-    filtre = {CHAMP_TEMPS: {"$gte": depuis}}
+    maintenant = maintenant or datetime.now(timezone.utc)
+    if maintenant.tzinfo is None:
+        maintenant = maintenant.replace(tzinfo=timezone.utc)
+    else:
+        maintenant = maintenant.astimezone(timezone.utc)
+    parametres = parametres or {
+        "eps_troupeau_m": 30,
+        "min_animaux_troupeau": 5,
+        "distance_alerte_m": 120,
+        "fraicheur_s": 600,
+    }
+    intervalle_s = int(getattr(modele, "intervalle_s", 300))
+    depuis = maintenant - timedelta(
+        hours=HISTORIQUE_H,
+        seconds=intervalle_s + int(parametres.get("fraicheur_s", 600)),
+    )
+    filtre = {CHAMP_TEMPS: {"$gte": depuis}, "ferme": FERME_PRINCIPALE}
     if client_id is not None:
         filtre["client_id"] = client_id
-    curseur = db[COLL_POSITIONS].find(
+    documents = list(db[COLL_POSITIONS].find(
         filtre,
-        {CHAMP_ANIMAL: 1, "client_id": 1, "numero_client": 1,
-         CHAMP_TEMPS: 1, CHAMP_LAT: 1, CHAMP_LON: 1}
-    ).sort([("client_id", 1), (CHAMP_ANIMAL, 1), (CHAMP_TEMPS, 1)])
+        {
+            CHAMP_ANIMAL: 1,
+            "client_id": 1,
+            "numero_client": 1,
+            "ferme": 1,
+            CHAMP_TEMPS: 1,
+            CHAMP_LAT: 1,
+            CHAMP_LON: 1,
+        },
+    ).sort([(CHAMP_TEMPS, 1)]))
 
-    bilan = {"animaux": 0, "alertes": 0}
-    for (tenant, animal), docs in groupby(
-        curseur, key=lambda d: (d.get("client_id"), d[CHAMP_ANIMAL])
-    ):
-        identifiant_etat = f"{tenant}:{animal}"
-        positions = []
-        numero_client = None
-        for d in docs:
-            t = d[CHAMP_TEMPS]
-            if t.tzinfo is None:                      # pymongo renvoie des dates naïves = UTC
-                t = t.replace(tzinfo=timezone.utc)
-            positions.append({"timestamp": t, "lat": d.get(CHAMP_LAT), "lon": d.get(CHAMP_LON)})
-            numero_client = d.get("numero_client", numero_client)
+    par_tenant = {}
+    for document in documents:
+        par_tenant.setdefault(document.get("client_id"), []).append(document)
+
+    bilan = {"troupeaux": 0, "alertes": 0}
+    for tenant, docs in par_tenant.items():
+        centres = construire_centres_troupeau(
+            docs, maintenant, parametres, intervalle_s=intervalle_s
+        )
+        if not centres:
+            continue
+        numero_client = docs[-1].get("numero_client")
+        identifiant_etat = f"{tenant}:{ID_TROUPEAU_PRINCIPAL}"
         ancien = db[COLL_ETAT].find_one({"_id": identifiant_etat}) or {}
         dc = ancien.get("derniere_cible")
         if dc is not None and dc.tzinfo is not None:      # relue « aware » (client tz_aware) : on revient à l'heure locale naïve du service
             ancien["derniere_cible"] = dc.replace(tzinfo=None)
-        etat, alertes = evaluer_animal(positions, ancien, modele, seuil)
+        etat, alertes = evaluer_animal(centres, ancien, modele, seuil)
         db[COLL_ETAT].replace_one(
             {"_id": identifiant_etat},
-            {**etat, "client_id": tenant, "animal_id": animal,
+            {**etat, "_id": identifiant_etat, "client_id": tenant,
+             "animal_id": ID_TROUPEAU_PRINCIPAL,
+             "nom_trajectoire": "Troupeau principal",
              "maj": datetime.now(timezone.utc)},
             upsert=True)
         if alertes:
-            enregistrer_alertes(db, animal, alertes, tenant, numero_client)
-        bilan["animaux"] += 1
+            enregistrer_alertes(
+                db,
+                ID_TROUPEAU_PRINCIPAL,
+                alertes,
+                tenant,
+                numero_client,
+                nom_trajectoire="Troupeau principal",
+            )
+        bilan["troupeaux"] += 1
         bilan["alertes"] += len(alertes)
     log.info("cycle LSTM : %s", bilan)
     return bilan
 
 
-def enregistrer_alertes(db, animal, alertes, client_id, numero_client):
+def enregistrer_alertes(
+    db, animal, alertes, client_id, numero_client, nom_trajectoire=None
+):
     docs = [{"animal_id": animal, "type": "mouvement_agite_lstm",
              "client_id": client_id, "numero_client": numero_client,
+             **({"nom_trajectoire": nom_trajectoire} if nom_trajectoire else {}),
              **a, "cree_le": datetime.now(timezone.utc)}
             for a in alertes]
     if MODE_SILENCIEUX:

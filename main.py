@@ -37,6 +37,14 @@ from colliers import (
     lister_colliers,
 )
 from messagerie import creer_routeur_messagerie
+from retention import (
+    DUREE_ALERTES_H,
+    DUREE_CONVERSATIONS_J,
+    DUREE_GPS_J,
+    DUREE_MPU_J,
+    DUREE_TEMPS_TRAVAIL_J,
+    nettoyer_donnees,
+)
 from temps_travail import creer_routeur_temps_travail
 
 MQTT_HOST = os.getenv("MQTT_HOST", "ycf81881.ala.eu-central-1.emqxsl.com")
@@ -61,7 +69,8 @@ INTERVALLE_VERIF_COLLIERS_S = 60   # vérification des colliers silencieux
 IA_AUTO = os.getenv("IA_AUTO", "true").lower() != "false"          # IA_AUTO=false pour le désactiver
 INTERVALLE_BILAN_IA_S = int(os.getenv("IA_INTERVALLE_S", "3600"))  # une fois par heure
 DELAI_PREMIER_BILAN_S = 60                                         # laisse le serveur démarrer
-DUREE_CONSERVATION_MESURES_S = 14 * 24 * 3600                      # TTL de mesures_activite : 14 jours
+DUREE_CONSERVATION_GPS_S = DUREE_GPS_J * 24 * 3600
+DUREE_CONSERVATION_MESURES_S = DUREE_MPU_J * 24 * 3600
 REFERENCE_JOURS = 4
 
 # AJOUT LSTM : alerte « mouvement agité », évaluée toutes les 15 min
@@ -69,16 +78,8 @@ LSTM_AUTO = os.getenv("LSTM_AUTO", "true").lower() != "false"
 INTERVALLE_LSTM_S = int(os.getenv("LSTM_INTERVALLE_S", "900"))
 DELAI_PREMIER_LSTM_S = 90
 
-# AJOUT NETTOYAGE : suppression automatique des anciennes données (économie de stockage)
-#   - alertes (TOUS types, actives ou résolues) : supprimées uniquement quand leur âge
-#     dépasse DUREE_ALERTES_H heures (24 h par défaut), jamais avant
-#   - autres données (positions, activité, événements LSTM, anciennes zones) :
-#     supprimées au-delà de DUREE_DONNEES_H heures (170 h par défaut)
-#   - JAMAIS touchés : fiches des animaux, paramètres, état courant des animaux, zone active,
-#     et comptes utilisateurs (collection « utilisateurs »)
+# Nettoyage automatique des données selon leurs durées de conservation.
 NETTOYAGE_AUTO = os.getenv("NETTOYAGE_AUTO", "true").lower() != "false"   # NETTOYAGE_AUTO=false pour le désactiver
-DUREE_ALERTES_H = float(os.getenv("DUREE_ALERTES_H", "24"))
-DUREE_DONNEES_H = float(os.getenv("DUREE_DONNEES_H", "170"))
 INTERVALLE_NETTOYAGE_S = int(os.getenv("NETTOYAGE_INTERVALLE_S", "600"))   # toutes les 10 min
 DELAI_PREMIER_NETTOYAGE_S = 120                                              # laisse le serveur démarrer
 
@@ -355,12 +356,12 @@ def appliquer_alerte_lstm(animal_id, condition, message, client_id):
 def executer_cycle_lstm():
     """AJOUT LSTM : un cycle d'analyse des trajectoires."""
     seuil = os.getenv("LSTM_SEUIL_M")          # vide = seuil du modèle
-    bilan = {"animaux": 0, "alertes": 0}
+    bilan = {"troupeaux": 0, "alertes": 0}
     for client in clients_col.find({}, {"_id": 1, "numero_client": 1}):
         resultat = trajectoire_service.executer_cycle(
             base, seuil=float(seuil) if seuil else None,
-            client_id=client["_id"])
-        bilan["animaux"] += resultat["animaux"]
+            client_id=client["_id"], parametres=P(client["_id"]))
+        bilan["troupeaux"] += resultat["troupeaux"]
         bilan["alertes"] += resultat["alertes"]
     print(f"Cycle LSTM : {bilan}")
     return bilan
@@ -378,25 +379,28 @@ async def surveillance_lstm():
 
 
 def creer_index_ttl():
-    """AJOUT IA AUTO : supprime automatiquement les mesures d'activité de plus de 14 jours.
+    """Ajoute les TTL GPS et MPU ; les anciens index simples sont convertis.
 
-    Si un index simple « timestamp_1 » existe déjà sans TTL (code 85), on le remplace."""
-    try:
-        mesures_activite.create_index(
-            "timestamp", expireAfterSeconds=DUREE_CONSERVATION_MESURES_S)
-    except OperationFailure as erreur:
-        if erreur.code != 85:
-            print(f"Index TTL mesures_activite non créé : {erreur}")
-            return
+    Si un index « timestamp_1 » existe avec une autre durée, il est remplacé."""
+    for collection, duree_s in (
+        (positions, DUREE_CONSERVATION_GPS_S),
+        (mesures_activite, DUREE_CONSERVATION_MESURES_S),
+    ):
         try:
-            mesures_activite.drop_index("timestamp_1")
-            mesures_activite.create_index(
-                "timestamp", expireAfterSeconds=DUREE_CONSERVATION_MESURES_S)
-            print("Index TTL mesures_activite converti (14 jours)")
-        except Exception as erreur2:
-            print(f"Index TTL mesures_activite non converti : {erreur2}")
-    except Exception as erreur:
-        print(f"Index TTL mesures_activite non créé : {erreur}")
+            collection.create_index("timestamp", expireAfterSeconds=int(duree_s))
+        except OperationFailure as erreur:
+            if erreur.code != 85:
+                print(f"Index TTL {collection.name} non créé : {erreur}")
+                continue
+            try:
+                collection.drop_index("timestamp_1")
+                collection.create_index(
+                    "timestamp", expireAfterSeconds=int(duree_s))
+                print(f"Index TTL {collection.name} mis à jour")
+            except Exception as erreur2:
+                print(f"Index TTL {collection.name} non converti : {erreur2}")
+        except Exception as erreur:
+            print(f"Index TTL {collection.name} non créé : {erreur}")
 
 
 def creer_index_animaux():
@@ -439,63 +443,45 @@ def creer_index_colliers():
 def creer_index_nettoyage():
     """AJOUT NETTOYAGE : index sur la date pour que les suppressions par âge soient rapides.
     Un échec ne doit pas empêcher le serveur de démarrer."""
-    for collection in (positions, alerts):
+    for collection, champ in (
+        (alerts, "timestamp"),
+        (lstm_evenements, "cree_le"),
+        (pasture, "cree_le"),
+        (base["temps_travail_evenements"], "horodatage_utc"),
+    ):
         try:
-            collection.create_index("timestamp")
+            collection.create_index(champ)
         except Exception as erreur:
-            print(f"Index timestamp non créé ({collection.name}) : {erreur}")
+            print(f"Index {champ} non créé ({collection.name}) : {erreur}")
 
 
 # ---------------------------------------------------------------------------
 # Nettoyage automatique de la base (AJOUT NETTOYAGE)
 # ---------------------------------------------------------------------------
+def _notifier_alerte_expiree(alerte, maintenant):
+    diffuseur.publier({"type": "alerte_resolue", "data": {
+        "animal_id": alerte["animal_id"],
+        "type": alerte["type"],
+        "resolue_le": maintenant,
+    }}, alerte["client_id"])
+
+
 def nettoyer_base(client_id=None):
-    """Supprime les anciennes données pour économiser le stockage.
-
-    - alertes de TOUS types, actives ou résolues : supprimées uniquement quand leur
-      âge dépasse DUREE_ALERTES_H (24 h). Avant 24 h, elles ne sont jamais touchées.
-    - positions, mesures d'activité, événements LSTM et anciennes zones de pâturage
-      plus vieux que DUREE_DONNEES_H (170 h)
-
-    Ne touche jamais : fiches des animaux (animaux), paramètres, état courant des
-    animaux (etat_animaux), zone de pâturage active et comptes utilisateurs."""
-    maintenant = datetime.now(timezone.utc)
-    limite_alertes = maintenant - timedelta(hours=DUREE_ALERTES_H)
-    limite_donnees = maintenant - timedelta(hours=DUREE_DONNEES_H)
-    bilan = {}
-
-    # --- Alertes : uniquement celles dont l'âge dépasse DUREE_ALERTES_H ---
-    filtre_alertes = {"timestamp": {"$lt": limite_alertes}}
-    filtre_donnees = {}
+    """Supprime automatiquement les données arrivées à leur durée de conservation."""
     if client_id is not None:
         client_id = _client_id(client_id)
-        filtre_alertes["client_id"] = client_id
-        filtre_donnees["client_id"] = client_id
-
-    # Les alertes encore actives qui vont disparaître sont retirées de l'application.
-    # Si le problème persiste, une nouvelle alerte sera créée au prochain contrôle.
-    for a in alerts.find({**filtre_alertes, "resolue": False},
-                         {"animal_id": 1, "type": 1, "client_id": 1}):
-        diffuseur.publier({"type": "alerte_resolue", "data": {
-            "animal_id": a["animal_id"],
-            "type": a["type"],
-            "resolue_le": maintenant,
-        }}, a["client_id"])
-    bilan["alertes"] = alerts.delete_many(filtre_alertes).deleted_count
-
-    # --- Autres données ---
-    bilan["positions"] = positions.delete_many(
-        {**filtre_donnees, "timestamp": {"$lt": limite_donnees}}).deleted_count
-    bilan["mesures_activite"] = mesures_activite.delete_many(
-        {**filtre_donnees, "timestamp": {"$lt": limite_donnees}}).deleted_count
-    bilan["evenements_lstm"] = lstm_evenements.delete_many(
-        {**filtre_donnees, "cree_le": {"$lt": limite_donnees}}).deleted_count
-    bilan["anciennes_zones"] = pasture.delete_many(
-        {**filtre_donnees, "active": False, "cree_le": {"$lt": limite_donnees}}).deleted_count
-
+    bilan = nettoyer_donnees(
+        base,
+        client_id=client_id,
+        notifier_alerte=_notifier_alerte_expiree,
+    )
     total = sum(bilan.values())
-    print(f"Nettoyage : {total} documents supprimés {bilan} "
-          f"(alertes > {DUREE_ALERTES_H:g} h, données > {DUREE_DONNEES_H:g} h)")
+    print(
+        f"Nettoyage : {total} documents supprimés {bilan} "
+        f"(GPS/MPU > {DUREE_GPS_J:g}/{DUREE_MPU_J:g} j, "
+        f"alertes > {DUREE_ALERTES_H:g} h, conversations inactives > "
+        f"{DUREE_CONVERSATIONS_J:g} j, tâches > {DUREE_TEMPS_TRAVAIL_J:g} j)"
+    )
     return bilan
 
 
@@ -862,6 +848,9 @@ async def lifespan(app: FastAPI):
     diffuseur.boucle = asyncio.get_running_loop()
     await asyncio.to_thread(
         positions.create_index, [("animal_id", 1), ("timestamp", -1)]
+    )
+    await asyncio.to_thread(
+        positions.create_index, [("client_id", 1), ("ferme", 1), ("timestamp", 1)]
     )
     await asyncio.to_thread(
         creer_index_etat_animaux

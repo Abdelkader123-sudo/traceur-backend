@@ -38,6 +38,30 @@ class ModifierTelephoneAnnuaire(BaseModel):
     telephone: str = Field(max_length=20)
 
 
+def nettoyer_conversations(db, limite_inactivite, client_id=None):
+    """Supprime les conversations inactives et leurs messages associés."""
+    conversations = db["conversations"]
+    messages = db["messages"]
+    filtre = {"updated_at": {"$lt": limite_inactivite}}
+    if client_id is not None:
+        filtre["client_id"] = client_id
+
+    bilan = {"conversations": 0, "messages": 0}
+    for ancienne in conversations.find(filtre, {"_id": 1}):
+        suppression = conversations.find_one_and_delete({
+            "_id": ancienne["_id"],
+            "updated_at": {"$lt": limite_inactivite},
+            **({"client_id": client_id} if client_id is not None else {}),
+        })
+        if suppression is None:
+            continue
+        bilan["conversations"] += 1
+        bilan["messages"] += messages.delete_many({
+            "conversation_id": suppression["_id"],
+        }).deleted_count
+    return bilan
+
+
 def _object_id(valeur: str) -> ObjectId:
     if not ObjectId.is_valid(valeur):
         raise HTTPException(status_code=400, detail="Identifiant utilisateur invalide.")
@@ -91,6 +115,7 @@ def creer_routeur_messagerie(db):
         partialFilterExpression={"type": "direct"},
     )
     conversations.create_index([("membres", 1), ("updated_at", -1)])
+    conversations.create_index("updated_at")
     messages.create_index([("conversation_id", 1), ("cree_le", -1)])
 
     router = APIRouter(prefix="/messagerie", tags=["messagerie"])
@@ -353,6 +378,17 @@ def creer_routeur_messagerie(db):
             raise HTTPException(status_code=422, detail="Le message ne peut pas être vide.")
 
         maintenant = datetime.now(timezone.utc)
+        actualisation = conversations.update_one(
+            {
+                "_id": conversation["_id"],
+                "membres": utilisateur["_id"],
+                "client_id": utilisateur["client_id"],
+            },
+            {"$set": {"updated_at": maintenant}},
+        )
+        if actualisation.matched_count != 1:
+            raise HTTPException(status_code=404, detail="Conversation introuvable.")
+
         document = {
             "conversation_id": conversation["_id"],
             "sender_id": utilisateur["_id"],
@@ -364,10 +400,7 @@ def creer_routeur_messagerie(db):
         document["_id"] = messages.insert_one(document).inserted_id
         conversations.update_one(
             {"_id": conversation["_id"], "client_id": utilisateur["client_id"]},
-            {"$set": {
-                "dernier_message": document,
-                "updated_at": maintenant,
-            }},
+            {"$set": {"dernier_message": document}},
         )
         if not fcm_prete():
             _log.warning("Push FCM non planifié : le service Firebase n’est pas prêt.")
