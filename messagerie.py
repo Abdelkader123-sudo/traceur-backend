@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from bson import ObjectId
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response
@@ -95,12 +95,14 @@ def _contact_annuaire_public(utilisateur: dict) -> dict:
 def _message_public(message: Optional[dict]) -> Optional[dict]:
     if message is None:
         return None
+    supprime_pour_tous = message.get("supprime_pour_tous", False)
     return {
         "id": str(message["_id"]),
         "conversation_id": str(message["conversation_id"]),
         "sender_id": str(message["sender_id"]),
-        "texte": message["texte"],
+        "texte": "" if supprime_pour_tous else message["texte"],
         "cree_le": message["cree_le"],
+        "supprime_pour_tous": supprime_pour_tous,
     }
 
 
@@ -142,6 +144,21 @@ def creer_routeur_messagerie(db):
             "client_id": utilisateur["client_id"],
         }))
         participants = [_utilisateur_public(membre) for membre in membres]
+        dernier_message = conversation.get("dernier_message")
+        if (
+            dernier_message is not None
+            and utilisateur["_id"] in dernier_message.get("masque_par", [])
+        ):
+            derniers_visibles = (
+                messages.find({
+                    "conversation_id": conversation["_id"],
+                    "client_id": utilisateur["client_id"],
+                    "masque_par": {"$ne": utilisateur["_id"]},
+                })
+                .sort("cree_le", -1)
+                .limit(1)
+            )
+            dernier_message = next(iter(derniers_visibles), None)
         titre = conversation.get("titre", "")
         if conversation["type"] == "direct":
             autre = next(
@@ -161,7 +178,7 @@ def creer_routeur_messagerie(db):
             "type": conversation["type"],
             "titre": titre,
             "membres": participants,
-            "dernier_message": _message_public(conversation.get("dernier_message")),
+            "dernier_message": _message_public(dernier_message),
             "cree_le": conversation["cree_le"],
             "updated_at": conversation["updated_at"],
         }
@@ -359,11 +376,80 @@ def creer_routeur_messagerie(db):
             messages.find({
                 "conversation_id": conversation["_id"],
                 "client_id": utilisateur["client_id"],
+                "masque_par": {"$ne": utilisateur["_id"]},
             })
             .sort("cree_le", -1)
             .limit(limite)
         )
         return [_message_public(document) for document in reversed(documents)]
+
+    @router.delete(
+        "/conversations/{conversation_id}/messages/{message_id}",
+        status_code=204,
+    )
+    def supprimer_message(
+        conversation_id: str,
+        message_id: str,
+        portee: Literal["moi", "tous"] = Query(...),
+        utilisateur: dict = Depends(courant),
+    ) -> Response:
+        conversation = exiger_conversation(conversation_id, utilisateur)
+        if not ObjectId.is_valid(message_id):
+            raise HTTPException(400, detail="Identifiant de message invalide.")
+        filtre = {
+            "_id": ObjectId(message_id),
+            "conversation_id": conversation["_id"],
+            "client_id": utilisateur["client_id"],
+        }
+        message = messages.find_one(filtre)
+        if message is None:
+            raise HTTPException(404, detail="Message introuvable.")
+        if message["sender_id"] != utilisateur["_id"]:
+            raise HTTPException(
+                403,
+                detail="Vous ne pouvez supprimer que vos propres messages.",
+            )
+        if message.get("supprime_pour_tous"):
+            return Response(status_code=204)
+
+        if portee == "moi":
+            resultat = messages.update_one(
+                {**filtre, "supprime_pour_tous": {"$ne": True}},
+                {"$addToSet": {"masque_par": utilisateur["_id"]}},
+            )
+            if resultat.matched_count:
+                message_actualise = messages.find_one(filtre)
+                conversations.update_one(
+                    {
+                        "_id": conversation["_id"],
+                        "client_id": utilisateur["client_id"],
+                        "dernier_message._id": message["_id"],
+                    },
+                    {"$set": {"dernier_message": message_actualise}},
+                )
+        else:
+            resultat = messages.update_one(
+                {**filtre, "supprime_pour_tous": {"$ne": True}},
+                {
+                    "$set": {
+                        "supprime_pour_tous": True,
+                        "texte": "",
+                        "supprime_le": datetime.now(timezone.utc),
+                    },
+                    "$unset": {"masque_par": ""},
+                },
+            )
+            if resultat.matched_count:
+                message_actualise = messages.find_one(filtre)
+                conversations.update_one(
+                    {
+                        "_id": conversation["_id"],
+                        "client_id": utilisateur["client_id"],
+                        "dernier_message._id": message["_id"],
+                    },
+                    {"$set": {"dernier_message": message_actualise}},
+                )
+        return Response(status_code=204)
 
     @router.post("/conversations/{conversation_id}/messages", status_code=201)
     def envoyer_message(
