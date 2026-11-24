@@ -8,11 +8,7 @@ from pydantic import BaseModel, Field
 from pymongo.errors import DuplicateKeyError
 
 from auth import creer_dependance_courant
-from fcm_notifications import (
-    ErreurNotificationFcm,
-    envoyer_notifications,
-    fcm_prete,
-)
+from fcm_notifications import envoyer_notifications, fcm_prete
 
 
 class EvenementTravail(BaseModel):
@@ -786,28 +782,15 @@ def creer_routeur_temps_travail(db):
                 "Une demande de position est déjà en attente pour cet utilisateur.",
             ) from erreur
         demande_id = str(resultat.inserted_id)
-        try:
-            identifiants_invalides = envoyer_notifications(
-                installations,
-                "Demande de position",
-                "Votre administrateur vous demande de partager votre position.",
-                {
-                    "type": "demande_localisation",
-                    "demande_id": demande_id,
-                },
-                echouer_sur_erreur=True,
-            )
-        except ErreurNotificationFcm as erreur:
-            demandes_presence_col.delete_one(
-                {
-                    "_id": resultat.inserted_id,
-                    "client_id": utilisateur["client_id"],
-                }
-            )
-            raise HTTPException(
-                502,
-                "La notification n’a pas pu être envoyée à cet utilisateur.",
-            ) from erreur
+        identifiants_invalides = envoyer_notifications(
+            installations,
+            "Demande de position",
+            "Votre administrateur vous demande de partager votre position.",
+            {
+                "type": "demande_localisation",
+                "demande_id": demande_id,
+            },
+        )
         if len(identifiants_invalides) >= len(installations):
             demandes_presence_col.delete_one(
                 {
