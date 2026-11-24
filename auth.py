@@ -149,6 +149,30 @@ def _cin_deja_utilise(users, client_id, cin: str, cin_hash: str) -> bool:
     return False
 
 
+def _candidats_connexion_sans_ferme(users, mot_de_passe: str) -> list:
+    empreinte_cin = _hachage_cin(mot_de_passe)
+    candidats = list(users.find({"cin_hash": empreinte_cin}))
+    identifiants = {utilisateur["_id"] for utilisateur in candidats}
+
+    anciens = users.find({"cin_hash": {"$exists": False}})
+    for utilisateur in anciens:
+        if (
+            utilisateur["_id"] not in identifiants
+            and _verifier(mot_de_passe, utilisateur["mot_de_passe"])
+        ):
+            candidats.append(utilisateur)
+            identifiants.add(utilisateur["_id"])
+            if utilisateur.get("role") != "superadmin":
+                users.update_one(
+                    {
+                        "_id": utilisateur["_id"],
+                        "cin_hash": {"$exists": False},
+                    },
+                    {"$set": {"cin_hash": empreinte_cin}},
+                )
+    return candidats
+
+
 def _numero_client(clients) -> str:
     for _ in range(10):
         numero = f"{secrets.randbelow(100_000_000):08d}"
@@ -467,15 +491,18 @@ form.addEventListener('submit',async event=>{
     @router.post("/auth/connexion")
     def connexion(corps: Connexion):
         if not corps.numero_client and not corps.nom:
-            raise HTTPException(422, "Associez votre ferme pour vous connecter.")
-        filtre = (
-            {"numero_client": corps.numero_client.strip()}
-            if corps.numero_client and not corps.nom
-            else {"nom_cle": _cle(corps.nom)}
-        )
-        if corps.numero_client and corps.nom:
-            filtre["numero_client"] = corps.numero_client.strip()
-        candidats = list(users.find(filtre))
+            candidats = _candidats_connexion_sans_ferme(
+                users, corps.mot_de_passe
+            )
+        else:
+            filtre = (
+                {"numero_client": corps.numero_client.strip()}
+                if corps.numero_client and not corps.nom
+                else {"nom_cle": _cle(corps.nom)}
+            )
+            if corps.numero_client and corps.nom:
+                filtre["numero_client"] = corps.numero_client.strip()
+            candidats = list(users.find(filtre))
         if not candidats:
             _verifier(corps.mot_de_passe, mdp_factice)
         valides = [
@@ -487,10 +514,10 @@ form.addEventListener('submit',async event=>{
         if len(valides) > 1:
             raise HTTPException(
                 409,
-                "Plusieurs comptes correspondent à ces informations. "
-                "Saisissez la clé de ferme pour distinguer votre compte.",
+                "Plusieurs comptes correspondent à ce mot de passe. "
+                "Contactez l’administrateur pour vérifier les comptes.",
             )
-        raise HTTPException(401, "Numéro client, nom ou mot de passe incorrect.")
+        raise HTTPException(401, "Identifiants incorrects.")
 
     @router.post("/auth/renouveler")
     def renouveler(corps: JetonSession):

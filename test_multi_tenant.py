@@ -271,6 +271,68 @@ class IsolationClientTests(unittest.TestCase):
 
         self.assertEqual(session["utilisateur"]["id"], str(utilisateur["_id"]))
 
+    def test_connexion_sans_code_ferme_retrouve_le_compte_par_cin(self):
+        base = BaseMemoire()
+        utilisateur = {
+            "_id": ObjectId(),
+            "nom": "Alice",
+            "nom_cle": "alice",
+            "role": "utilisateur",
+            "client_id": ObjectId(),
+            "numero_client": "00000001",
+            "mot_de_passe": _hacher("12345678"),
+            "cin_hash": _hachage_cin("12345678"),
+        }
+        base["utilisateurs"].insert_one(utilisateur)
+        connexion = _route(creer_routeur(base), "/auth/connexion", "POST")
+
+        session = connexion(Connexion(mot_de_passe="12345678"))
+
+        self.assertEqual(session["utilisateur"]["id"], str(utilisateur["_id"]))
+        self.assertEqual(session["utilisateur"]["numero_client"], "00000001")
+
+    def test_connexion_sans_code_migre_le_cin_d_un_ancien_compte(self):
+        base = BaseMemoire()
+        utilisateur = {
+            "_id": ObjectId(),
+            "nom": "Alice",
+            "nom_cle": "alice",
+            "role": "utilisateur",
+            "client_id": ObjectId(),
+            "numero_client": "00000001",
+            "mot_de_passe": _hacher("12345678"),
+        }
+        base["utilisateurs"].insert_one(utilisateur)
+        connexion = _route(creer_routeur(base), "/auth/connexion", "POST")
+
+        session = connexion(Connexion(mot_de_passe="12345678"))
+
+        self.assertEqual(session["utilisateur"]["id"], str(utilisateur["_id"]))
+        self.assertEqual(
+            utilisateur["cin_hash"],
+            _hachage_cin("12345678"),
+        )
+
+    def test_connexion_sans_code_refuse_un_cin_ambigu(self):
+        base = BaseMemoire()
+        for numero, nom in (("00000001", "Alice"), ("00000002", "Bob")):
+            base["utilisateurs"].insert_one({
+                "_id": ObjectId(),
+                "nom": nom,
+                "nom_cle": nom.lower(),
+                "role": "utilisateur",
+                "client_id": ObjectId(),
+                "numero_client": numero,
+                "mot_de_passe": _hacher("12345678"),
+                "cin_hash": _hachage_cin("12345678"),
+            })
+        connexion = _route(creer_routeur(base), "/auth/connexion", "POST")
+
+        with self.assertRaises(HTTPException) as erreur:
+            connexion(Connexion(mot_de_passe="12345678"))
+
+        self.assertEqual(erreur.exception.status_code, 409)
+
     def test_meme_mot_de_passe_ouvre_le_compte_de_chaque_ferme(self):
         base = BaseMemoire()
         utilisateur_a = {
@@ -305,7 +367,7 @@ class IsolationClientTests(unittest.TestCase):
         self.assertEqual(session_a["utilisateur"]["id"], str(utilisateur_a["_id"]))
         self.assertEqual(session_b["utilisateur"]["id"], str(utilisateur_b["_id"]))
 
-    def test_connexion_sans_ferme_ou_nom_est_refusee(self):
+    def test_connexion_sans_cin_correspondant_est_refusee(self):
         connexion = _route(
             creer_routeur(BaseMemoire()),
             "/auth/connexion",
@@ -313,7 +375,7 @@ class IsolationClientTests(unittest.TestCase):
         )
         with self.assertRaises(HTTPException) as erreur:
             connexion(Connexion(mot_de_passe="mot-de-passe"))
-        self.assertEqual(erreur.exception.status_code, 422)
+        self.assertEqual(erreur.exception.status_code, 401)
 
     def test_creation_et_modification_des_pages_autorisees(self):
         base = BaseMemoire()
@@ -332,14 +394,20 @@ class IsolationClientTests(unittest.TestCase):
                 residence="Rabat",
                 telephone="0612345678",
                 cin="12345678",
-                pages_autorisees=["map", "notifications", "health"],
+                pages_autorisees=[
+                    "map",
+                    "notifications",
+                    "health",
+                    "worktime",
+                    "animal_sales",
+                ],
             ),
             u=client,
         )
         self.assertEqual(utilisateur["role"], "utilisateur")
         self.assertEqual(
             utilisateur["pages_autorisees"],
-            ["map", "notifications", "health"],
+            ["map", "notifications", "health", "worktime", "animal_sales"],
         )
         self.assertNotIn("age", utilisateur)
 
@@ -351,13 +419,19 @@ class IsolationClientTests(unittest.TestCase):
         resultat = modifier(
             utilisateur["id"],
             PermissionsUtilisateur(
-                pages_autorisees=["map", "alerts", "notifications"]
+                pages_autorisees=[
+                    "map",
+                    "alerts",
+                    "notifications",
+                    "animal_sales",
+                    "worktime",
+                ]
             ),
             u=client,
         )
         self.assertEqual(
             resultat["pages_autorisees"],
-            ["map", "alerts", "notifications"],
+            ["map", "alerts", "notifications", "animal_sales", "worktime"],
         )
 
     def test_mot_de_passe_reutilisable_entre_fermes_mais_unique_dans_la_ferme(self):
