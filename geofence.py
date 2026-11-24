@@ -51,3 +51,9 @@ def analyser_point(lat: float, lon: float, sommets: list) -> tuple[bool, float]:
 
     bord = min(_dist_segment(px, py, *pts[i], *pts[(i + 1) % n]) for i in range(n))
     return dedans, bord
+
+
+def evaluer_hors_zone(lat: float, lon: float, sommets: list) -> tuple[bool, float]:
+    """Retourne si le point est hors du polygone et sa distance au bord."""
+    dedans, distance_bord = analyser_point(lat, lon, sommets)
+    return not dedans, distance_bord
