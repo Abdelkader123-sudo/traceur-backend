@@ -32,11 +32,22 @@ def analyser_troupeaux(derniers, p):
         return None, [], {}
 
     coords = np.radians([[d["lat"], d["lon"]] for d in derniers])
+    rayon_m = float(p["eps_troupeau_m"])
     labels = DBSCAN(
-        eps=p["eps_troupeau_m"] / RAYON_TERRE_M,
+        eps=rayon_m / RAYON_TERRE_M,
         min_samples=2,
         metric="haversine",
     ).fit_predict(coords)
+    if np.all(labels == -1):
+        rayon_secours_m = max(
+            rayon_m, min(100.0, float(p["distance_alerte_m"]))
+        )
+        if rayon_secours_m > rayon_m:
+            labels = DBSCAN(
+                eps=rayon_secours_m / RAYON_TERRE_M,
+                min_samples=2,
+                metric="haversine",
+            ).fit_predict(coords)
 
     # Les points « bruit » (-1) deviennent des groupes individuels
     suivant = int(labels.max()) + 1

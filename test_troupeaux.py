@@ -28,6 +28,18 @@ class TroupeauxTests(unittest.TestCase):
         self.assertEqual(autres[0]["type"], "troupeau")
         self.assertEqual(autres[0]["zone"]["nb_animaux"], 2)
 
+    def test_elargit_le_rayon_si_le_reglage_ne_detecte_aucun_groupe(self):
+        pas_lat = 50 / 111_320
+        positions = [
+            {"animal_id": f"a{index}", "lat": 36.75 + index * pas_lat, "lon": 3.04}
+            for index in range(5)
+        ]
+
+        principal, autres, _ = analyser_troupeaux(positions, PARAMETRES)
+
+        self.assertEqual(principal["nb_animaux"], 5)
+        self.assertEqual(autres, [])
+
 
 if __name__ == "__main__":
     unittest.main()
