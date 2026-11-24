@@ -34,8 +34,7 @@ def analyser_troupeaux(derniers, p):
     coords = np.radians([[d["lat"], d["lon"]] for d in derniers])
     labels = DBSCAN(
         eps=p["eps_troupeau_m"] / RAYON_TERRE_M,
-        # MODIFIÉ : le paramètre « Animaux minimum » pilote maintenant le clustering
-        min_samples=max(2, int(p["min_animaux_troupeau"])),
+        min_samples=2,
         metric="haversine",
     ).fit_predict(coords)
 
