@@ -2,6 +2,7 @@ import os
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("JWT_SECRET", "temps-travail-test-secret-with-at-least-32-bytes")
 
@@ -11,6 +12,7 @@ from fastapi import HTTPException
 from temps_travail import (
     EvenementTravail,
     RapportPresence,
+    RapportPositionDemandee,
     ZoneTravail,
     creer_routeur_temps_travail,
 )
@@ -29,6 +31,8 @@ class CollectionMemoire:
             courant = document.get(cle)
             if isinstance(valeur, dict):
                 if "$ne" in valeur and courant == valeur["$ne"]:
+                    return False
+                if "$gt" in valeur and courant <= valeur["$gt"]:
                     return False
                 if "$gte" in valeur and courant < valeur["$gte"]:
                     return False
@@ -58,12 +62,14 @@ class CollectionMemoire:
 
     def update_one(self, filtre, modification, upsert=False):
         document = self.find_one(filtre)
+        matched_count = 1 if document is not None else 0
         if document is None:
             if not upsert:
-                return
+                return SimpleNamespace(matched_count=0)
             document = dict(filtre)
             self.documents.append(document)
         document.update(modification["$set"])
+        return SimpleNamespace(matched_count=matched_count)
 
     def delete_one(self, filtre):
         document = self.find_one(filtre)
@@ -166,6 +172,21 @@ class TempsTravailTests(unittest.TestCase):
             self.routeur,
             "/admin/temps-travail/presence",
             "GET",
+        )
+        self.demander_position = _route(
+            self.routeur,
+            "/admin/temps-travail/presence/demandes/{utilisateur_id}",
+            "POST",
+        )
+        self.transmettre_position_demandee = _route(
+            self.routeur,
+            "/temps-travail/presence/demandes/{demande_id}/position",
+            "POST",
+        )
+        self.refuser_demande_position = _route(
+            self.routeur,
+            "/temps-travail/presence/demandes/{demande_id}/refus",
+            "POST",
         )
 
     def test_enregistre_les_evenements_de_maniere_idempotente_et_renvoie_etat(self):
@@ -418,6 +439,117 @@ class TempsTravailTests(unittest.TestCase):
         self.assertEqual(utilisateur["statut"], "hors_ferme")
         self.assertTrue(utilisateur["presence_verifiee"])
 
+    @patch("temps_travail.envoyer_notifications", return_value=[])
+    @patch("temps_travail.fcm_prete", return_value=True)
+    def test_demande_admin_partage_position_apres_accord_sans_journee_active(
+        self,
+        fcm_disponible,
+        envoyer,
+    ):
+        self.utilisateur["fcm_installation_ids"] = ["installation-employe"]
+
+        with self.assertRaises(HTTPException) as erreur:
+            self.demander_position(
+                str(self.utilisateur["_id"]),
+                self.utilisateur,
+            )
+        self.assertEqual(erreur.exception.status_code, 403)
+
+        resultat = self.demander_position(
+            str(self.utilisateur["_id"]),
+            self.proprietaire,
+        )
+        demande_id = resultat["demande_id"]
+        envoyer.assert_called_once()
+        self.assertEqual(
+            envoyer.call_args.args[3],
+            {
+                "type": "demande_localisation",
+                "demande_id": demande_id,
+            },
+        )
+        fcm_disponible.assert_called_once()
+        demande = self.base["temps_travail_demandes_presence"].documents[0]
+        self.assertEqual(
+            demande["expire_le_utc"] - demande["cree_le_utc"],
+            timedelta(minutes=15),
+        )
+        attente = self.presences_admin(self.proprietaire)["utilisateurs"][0]
+        self.assertEqual(attente["demande_localisation_statut"], "en_attente")
+        self.assertIsNone(attente["latitude"])
+        with self.assertRaises(HTTPException) as erreur:
+            self.demander_position(
+                str(self.utilisateur["_id"]),
+                self.proprietaire,
+            )
+        self.assertEqual(erreur.exception.status_code, 409)
+
+        with self.assertRaises(HTTPException) as erreur:
+            self.transmettre_position_demandee(
+                demande_id,
+                RapportPositionDemandee(
+                    latitude=36.8,
+                    longitude=10.1,
+                    precision_m=8,
+                    est_simulee=True,
+                ),
+                self.utilisateur,
+            )
+        self.assertEqual(erreur.exception.status_code, 422)
+
+        self.transmettre_position_demandee(
+            demande_id,
+            RapportPositionDemandee(
+                latitude=36.8,
+                longitude=10.1,
+                precision_m=8,
+            ),
+            self.utilisateur,
+        )
+        utilisateur = self.presences_admin(self.proprietaire)["utilisateurs"][0]
+
+        self.assertFalse(utilisateur["journee_active"])
+        self.assertEqual(utilisateur["demande_localisation_statut"], "terminee")
+        self.assertEqual(utilisateur["latitude"], 36.8)
+        self.assertEqual(utilisateur["longitude"], 10.1)
+        demande = self.base["temps_travail_demandes_presence"].documents[0]
+        self.assertEqual(
+            demande["expire_le_utc"] - demande["recu_le_utc"],
+            timedelta(minutes=15),
+        )
+
+    @patch("temps_travail.envoyer_notifications", return_value=[])
+    @patch("temps_travail.fcm_prete", return_value=True)
+    def test_demande_position_refusee_et_isolee_a_son_destinataire(
+        self,
+        fcm_disponible,
+        envoyer,
+    ):
+        self.utilisateur["fcm_installation_ids"] = ["installation-employe"]
+        demande_id = self.demander_position(
+            str(self.utilisateur["_id"]),
+            self.proprietaire,
+        )["demande_id"]
+        autre_utilisateur = {
+            "_id": ObjectId(),
+            "client_id": self.client_id,
+            "role": "admin",
+        }
+
+        with self.assertRaises(HTTPException) as erreur:
+            self.refuser_demande_position(demande_id, autre_utilisateur)
+        self.assertEqual(erreur.exception.status_code, 404)
+
+        resultat = self.refuser_demande_position(
+            demande_id,
+            self.utilisateur,
+        )
+        utilisateur = self.presences_admin(self.proprietaire)["utilisateurs"][0]
+
+        self.assertEqual(resultat["statut"], "refusee")
+        self.assertEqual(utilisateur["demande_localisation_statut"], "refusee")
+        self.assertIsNone(utilisateur["latitude"])
+
     def test_position_a_la_limite_ne_confirme_pas_injustement_la_zone(self):
         maintenant = datetime.now(timezone.utc)
         self.enregistrer(
@@ -489,22 +621,24 @@ class TempsTravailTests(unittest.TestCase):
             ZoneTravail(latitude=36.8, longitude=10.1, rayon_m=100),
             self.proprietaire,
         )
-        self.enregistrer_presence(
-            RapportPresence(
-                journee_id="journee-presence",
-                latitude=36.8,
-                longitude=10.1,
-                precision_m=5,
-                est_simulee=True,
-            ),
-            self.utilisateur,
-        )
+        with self.assertRaises(HTTPException) as erreur:
+            self.enregistrer_presence(
+                RapportPresence(
+                    journee_id="journee-presence",
+                    latitude=36.8,
+                    longitude=10.1,
+                    precision_m=5,
+                    est_simulee=True,
+                ),
+                self.utilisateur,
+            )
+        self.assertEqual(erreur.exception.status_code, 422)
 
         utilisateur = self.presences_admin(self.proprietaire)["utilisateurs"][0]
         self.assertEqual(utilisateur["statut"], "non_verifiee")
         self.assertFalse(utilisateur["presence_verifiee"])
-        self.assertEqual(utilisateur["latitude"], 36.8)
-        self.assertEqual(utilisateur["longitude"], 10.1)
+        self.assertIsNone(utilisateur["latitude"])
+        self.assertIsNone(utilisateur["longitude"])
 
     def test_presence_perimee_ou_imprecise_n_est_pas_confirmee(self):
         maintenant = datetime.now(timezone.utc)
