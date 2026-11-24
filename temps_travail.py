@@ -2,11 +2,17 @@ from datetime import date, datetime, timedelta, timezone
 import math
 from typing import Literal, Optional
 
+from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from pymongo.errors import DuplicateKeyError
 
 from auth import creer_dependance_courant
+from fcm_notifications import (
+    ErreurNotificationFcm,
+    envoyer_notifications,
+    fcm_prete,
+)
 
 
 class EvenementTravail(BaseModel):
@@ -22,6 +28,13 @@ class EvenementTravail(BaseModel):
 
 class RapportPresence(BaseModel):
     journee_id: str = Field(min_length=1, max_length=128)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    precision_m: float = Field(gt=0, le=10000)
+    est_simulee: bool = False
+
+
+class RapportPositionDemandee(BaseModel):
     latitude: float = Field(ge=-90, le=90)
     longitude: float = Field(ge=-180, le=180)
     precision_m: float = Field(gt=0, le=10000)
@@ -361,6 +374,7 @@ def creer_routeur_temps_travail(db):
     users = db["utilisateurs"]
     evenements_col = db["temps_travail_evenements"]
     presence_col = db["temps_travail_presence"]
+    demandes_presence_col = db["temps_travail_demandes_presence"]
     zones_col = db["temps_travail_zones"]
     evenements_col.create_index(
         [("client_id", 1), ("utilisateur_id", 1), ("evenement_id", 1)],
@@ -380,6 +394,17 @@ def creer_routeur_temps_travail(db):
         "recu_le_utc",
         expireAfterSeconds=24 * 60 * 60,
         name="temps_travail_presence_expiration",
+    )
+    demandes_presence_col.create_index(
+        [("client_id", 1), ("utilisateur_id", 1), ("statut", 1)],
+        unique=True,
+        partialFilterExpression={"statut": "en_attente"},
+        name="temps_travail_demandes_presence_utilisateur",
+    )
+    demandes_presence_col.create_index(
+        "expire_le_utc",
+        expireAfterSeconds=0,
+        name="temps_travail_demandes_presence_expiration",
     )
     zones_col.create_index(
         [("client_id", 1)],
@@ -683,6 +708,199 @@ def creer_routeur_temps_travail(db):
             "dans_ferme": dans_ferme,
         }
 
+    @router.post(
+        "/admin/temps-travail/presence/demandes/{utilisateur_id}",
+        status_code=201,
+    )
+    def demander_position(
+        utilisateur_id: str,
+        utilisateur: dict = Depends(courant),
+    ):
+        _verifier_proprietaire(utilisateur)
+        if not ObjectId.is_valid(utilisateur_id):
+            raise HTTPException(404, "Utilisateur introuvable.")
+        membre = users.find_one(
+            {
+                "_id": ObjectId(utilisateur_id),
+                "client_id": utilisateur["client_id"],
+                "role": {"$ne": "superadmin"},
+            }
+        )
+        if membre is None:
+            raise HTTPException(404, "Utilisateur introuvable.")
+
+        installations = list(
+            dict.fromkeys(
+                installation
+                for installation in membre.get("fcm_installation_ids", [])
+                if isinstance(installation, str) and installation
+            )
+        )
+        if not installations:
+            raise HTTPException(
+                409,
+                "Cet utilisateur n’a pas activé les notifications sur son appareil.",
+            )
+        if not fcm_prete():
+            raise HTTPException(
+                503,
+                "Le service de notification est momentanément indisponible.",
+            )
+
+        maintenant = datetime.now(timezone.utc)
+        demandes_existantes = demandes_presence_col.find(
+            {
+                "client_id": utilisateur["client_id"],
+                "utilisateur_id": membre["_id"],
+            }
+        )
+        for demande_existante in demandes_existantes:
+            if demande_existante.get("statut") != "en_attente":
+                continue
+            if _utc(demande_existante["expire_le_utc"]) > maintenant:
+                raise HTTPException(
+                    409,
+                    "Une demande de position est déjà en attente pour cet utilisateur.",
+                )
+            demandes_presence_col.update_one(
+                {
+                    "_id": demande_existante["_id"],
+                    "statut": "en_attente",
+                },
+                {"$set": {"statut": "expiree"}},
+            )
+
+        demande = {
+            "client_id": utilisateur["client_id"],
+            "utilisateur_id": membre["_id"],
+            "demandeur_id": utilisateur["_id"],
+            "statut": "en_attente",
+            "cree_le_utc": maintenant,
+            "expire_le_utc": maintenant + DUREE_DEMANDE_POSITION,
+        }
+        try:
+            resultat = demandes_presence_col.insert_one(demande)
+        except DuplicateKeyError as erreur:
+            raise HTTPException(
+                409,
+                "Une demande de position est déjà en attente pour cet utilisateur.",
+            ) from erreur
+        demande_id = str(resultat.inserted_id)
+        try:
+            identifiants_invalides = envoyer_notifications(
+                installations,
+                "Demande de position",
+                "Votre administrateur vous demande de partager votre position.",
+                {
+                    "type": "demande_localisation",
+                    "demande_id": demande_id,
+                },
+                echouer_sur_erreur=True,
+            )
+        except ErreurNotificationFcm as erreur:
+            demandes_presence_col.delete_one(
+                {
+                    "_id": resultat.inserted_id,
+                    "client_id": utilisateur["client_id"],
+                }
+            )
+            raise HTTPException(
+                502,
+                "La notification n’a pas pu être envoyée à cet utilisateur.",
+            ) from erreur
+        if len(identifiants_invalides) >= len(installations):
+            demandes_presence_col.delete_one(
+                {
+                    "_id": resultat.inserted_id,
+                    "client_id": utilisateur["client_id"],
+                }
+            )
+            raise HTTPException(
+                502,
+                "La notification n’a pas pu être envoyée à cet utilisateur.",
+            )
+        return {
+            "demande_id": demande_id,
+            "expire_le_utc": _iso(demande["expire_le_utc"]),
+        }
+
+    @router.post("/temps-travail/presence/demandes/{demande_id}/position")
+    def transmettre_position_demandee(
+        demande_id: str,
+        corps: RapportPositionDemandee,
+        utilisateur: dict = Depends(courant),
+    ):
+        if not ObjectId.is_valid(demande_id):
+            raise HTTPException(404, "Demande de position introuvable.")
+        filtre = {
+            "_id": ObjectId(demande_id),
+            "client_id": utilisateur["client_id"],
+            "utilisateur_id": utilisateur["_id"],
+            "statut": "en_attente",
+        }
+        demande = demandes_presence_col.find_one(filtre)
+        if demande is None:
+            raise HTTPException(404, "Demande de position introuvable.")
+        maintenant = datetime.now(timezone.utc)
+        if _utc(demande["expire_le_utc"]) <= maintenant:
+            raise HTTPException(410, "Cette demande de position a expiré.")
+        if corps.est_simulee or corps.precision_m > MAX_PRECISION_PRESENCE_METRES:
+            raise HTTPException(
+                422,
+                "Une position réelle et suffisamment précise est nécessaire.",
+            )
+        resultat = demandes_presence_col.update_one(
+            {**filtre, "expire_le_utc": {"$gt": maintenant}},
+            {
+                "$set": {
+                    "statut": "terminee",
+                    "latitude": corps.latitude,
+                    "longitude": corps.longitude,
+                    "precision_m": corps.precision_m,
+                    "recu_le_utc": maintenant,
+                    "expire_le_utc": maintenant + DUREE_VISIBILITE_POSITION,
+                }
+            },
+        )
+        if resultat.matched_count == 0:
+            raise HTTPException(409, "Cette demande n’est plus en attente.")
+        return {
+            "statut": "terminee",
+            "recu_le_utc": _iso(maintenant),
+        }
+
+    @router.post("/temps-travail/presence/demandes/{demande_id}/refus")
+    def refuser_demande_position(
+        demande_id: str,
+        utilisateur: dict = Depends(courant),
+    ):
+        if not ObjectId.is_valid(demande_id):
+            raise HTTPException(404, "Demande de position introuvable.")
+        filtre = {
+            "_id": ObjectId(demande_id),
+            "client_id": utilisateur["client_id"],
+            "utilisateur_id": utilisateur["_id"],
+            "statut": "en_attente",
+        }
+        demande = demandes_presence_col.find_one(filtre)
+        if demande is None:
+            raise HTTPException(404, "Demande de position introuvable.")
+        maintenant = datetime.now(timezone.utc)
+        if _utc(demande["expire_le_utc"]) <= maintenant:
+            raise HTTPException(410, "Cette demande de position a expiré.")
+        resultat = demandes_presence_col.update_one(
+            {**filtre, "expire_le_utc": {"$gt": maintenant}},
+            {
+                "$set": {
+                    "statut": "refusee",
+                    "refusee_le_utc": maintenant,
+                }
+            },
+        )
+        if resultat.matched_count == 0:
+            raise HTTPException(409, "Cette demande n’est plus en attente.")
+        return {"statut": "refusee"}
+
     @router.get("/admin/temps-travail/presence")
     def presences_admin(utilisateur: dict = Depends(courant)):
         _verifier_proprietaire(utilisateur)
@@ -697,6 +915,18 @@ def creer_routeur_temps_travail(db):
             )
         )
         maintenant = datetime.now(timezone.utc)
+        demandes_par_utilisateur = {}
+        for demande in demandes_presence_col.find({"client_id": client_id}):
+            if _utc(demande["expire_le_utc"]) <= maintenant:
+                continue
+            existante = demandes_par_utilisateur.get(demande["utilisateur_id"])
+            if (
+                existante is None
+                or _utc(demande["cree_le_utc"])
+                > _utc(existante["cree_le_utc"])
+            ):
+                demandes_par_utilisateur[demande["utilisateur_id"]] = demande
+
         utilisateurs = []
         for membre in membres:
             etat = _etat_courant(membre)
@@ -723,6 +953,29 @@ def creer_routeur_temps_travail(db):
                     >= _utc(zone["mis_a_jour_utc"])
                 )
             )
+            demande_position = demandes_par_utilisateur.get(membre["_id"])
+            latitude = (
+                presence.get("latitude")
+                if presence_recente and presence
+                else None
+            )
+            longitude = (
+                presence.get("longitude")
+                if presence_recente and presence
+                else None
+            )
+            if (
+                demande_position is not None
+                and demande_position.get("statut") == "terminee"
+                and (
+                    derniere_verification is None
+                    or _utc(demande_position["recu_le_utc"])
+                    >= _utc(derniere_verification)
+                )
+            ):
+                latitude = demande_position["latitude"]
+                longitude = demande_position["longitude"]
+                derniere_verification = demande_position["recu_le_utc"]
             precision_fiable = bool(
                 presence
                 and presence.get("precision_fiable")
@@ -771,21 +1024,18 @@ def creer_routeur_temps_travail(db):
                     ),
                     "statut": statut,
                     "presence_verifiee": verifiee,
+                    "demande_localisation_statut": (
+                        demande_position.get("statut")
+                        if demande_position is not None
+                        else None
+                    ),
                     "derniere_verification_utc": (
                         _iso(derniere_verification)
                         if derniere_verification is not None
                         else None
                     ),
-                    "latitude": (
-                        presence.get("latitude")
-                        if presence_recente and presence
-                        else None
-                    ),
-                    "longitude": (
-                        presence.get("longitude")
-                        if presence_recente and presence
-                        else None
-                    ),
+                    "latitude": latitude,
+                    "longitude": longitude,
                 }
             )
         utilisateurs.sort(key=lambda personne: personne["nom"].lower())
@@ -808,3 +1058,5 @@ def creer_routeur_temps_travail(db):
 INTERVALLE_PRESENCE_SECONDES = 10 * 60
 AGE_MAX_PRESENCE = timedelta(minutes=20)
 MAX_PRECISION_PRESENCE_METRES = 100
+DUREE_DEMANDE_POSITION = timedelta(minutes=15)
+DUREE_VISIBILITE_POSITION = timedelta(minutes=15)
