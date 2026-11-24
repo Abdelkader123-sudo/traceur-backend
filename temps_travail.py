@@ -69,6 +69,29 @@ def _valider_evenement(evenement: dict):
         raise HTTPException(422, "Une journée ne doit pas référencer une tâche.")
 
 
+def _fin_journee_utc(date_jour: date, decalage_minutes: int) -> datetime:
+    fuseau = timezone(timedelta(minutes=decalage_minutes))
+    minuit_local_suivant = datetime.combine(
+        date_jour + timedelta(days=1),
+        datetime.min.time(),
+        tzinfo=fuseau,
+    )
+    return minuit_local_suivant.astimezone(timezone.utc)
+
+
+def _duree_jusqua_fin_journee(
+    debut: datetime,
+    fin: datetime,
+    date_jour: date,
+    decalage_minutes: int,
+) -> int:
+    fin_effective = min(
+        _utc(fin),
+        _fin_journee_utc(date_jour, decalage_minutes),
+    )
+    return max(0, int((fin_effective - _utc(debut)).total_seconds()))
+
+
 def _rejouer(evenements: list[dict]) -> dict:
     etat = {
         "journee_active": None,
@@ -111,6 +134,7 @@ def _rejouer(evenements: list[dict]) -> dict:
                             "nom": tache["nom"],
                             "debut_utc": tache["debut_utc"],
                             "fin_utc": _iso(instant),
+                            "decalage_minutes": tache["decalage_minutes"],
                             "duree_secondes": int(
                                 (instant - debut_tache).total_seconds()
                             ),
@@ -127,6 +151,7 @@ def _rejouer(evenements: list[dict]) -> dict:
                         "debut_utc": journee["debut_utc"],
                         "fin_utc": _iso(instant),
                         "date_locale": journee["date_locale"],
+                        "decalage_minutes": journee["decalage_minutes"],
                         "duree_secondes": int(
                             (instant - debut_journee).total_seconds()
                         ),
@@ -156,6 +181,7 @@ def _rejouer(evenements: list[dict]) -> dict:
                         "nom": tache["nom"],
                         "debut_utc": tache["debut_utc"],
                         "fin_utc": _iso(instant),
+                        "decalage_minutes": tache["decalage_minutes"],
                         "duree_secondes": int(
                             (instant - debut_tache).total_seconds()
                         ),
@@ -174,6 +200,7 @@ def _rejouer(evenements: list[dict]) -> dict:
                 "nom": evenement["nom_tache"].strip(),
                 "debut_utc": _iso(instant),
                 "journee_id": journee_id,
+                "decalage_minutes": journee["decalage_minutes"],
             }
         elif type_evenement == "tache_fin":
             if (
@@ -196,6 +223,7 @@ def _rejouer(evenements: list[dict]) -> dict:
                     "nom": tache["nom"],
                     "debut_utc": tache["debut_utc"],
                     "fin_utc": _iso(instant),
+                    "decalage_minutes": tache["decalage_minutes"],
                     "duree_secondes": int((instant - debut_tache).total_seconds()),
                 }
             )
@@ -222,6 +250,7 @@ def _rejouer(evenements: list[dict]) -> dict:
                         "nom": tache["nom"],
                         "debut_utc": tache["debut_utc"],
                         "fin_utc": _iso(instant),
+                        "decalage_minutes": tache["decalage_minutes"],
                         "duree_secondes": int(
                             (instant - debut_tache).total_seconds()
                         ),
@@ -238,6 +267,7 @@ def _rejouer(evenements: list[dict]) -> dict:
                     "debut_utc": journee["debut_utc"],
                     "fin_utc": _iso(instant),
                     "date_locale": journee["date_locale"],
+                    "decalage_minutes": journee["decalage_minutes"],
                     "duree_secondes": int(
                         (instant - debut_journee).total_seconds()
                     ),
@@ -257,17 +287,32 @@ def _statistique_jour(
     etat = _rejouer(evenements)
     journees = list(etat["journees_du_jour"])
     taches = list(etat["taches_du_jour"])
-    duree = sum(journee["duree_secondes"] for journee in journees)
+    duree = sum(
+        _duree_jusqua_fin_journee(
+            datetime.fromisoformat(journee["debut_utc"]),
+            datetime.fromisoformat(journee["fin_utc"]),
+            date_jour,
+            journee.get("decalage_minutes", 0),
+        )
+        for journee in journees
+    )
 
     active = etat["journee_active"]
     if active is not None:
         debut_journee = datetime.fromisoformat(active["debut_utc"])
-        fin_journee = (
-            maintenant
-            if active["date_locale"] == date_jour.isoformat()
-            else debut_journee
+        decalage_minutes = active.get("decalage_minutes", 0)
+        fin_journee = min(
+            _utc(maintenant),
+            _fin_journee_utc(date_jour, decalage_minutes),
         )
-        duree += max(0, int((fin_journee - debut_journee).total_seconds()))
+        if active["date_locale"] != date_jour.isoformat():
+            fin_journee = debut_journee
+        duree += _duree_jusqua_fin_journee(
+            debut_journee,
+            fin_journee,
+            date_jour,
+            decalage_minutes,
+        )
         tache = etat["tache_active"]
         if tache is not None:
             debut_tache = datetime.fromisoformat(tache["debut_utc"])
@@ -277,7 +322,10 @@ def _statistique_jour(
                     "nom": tache["nom"],
                     "debut_utc": tache["debut_utc"],
                     "fin_utc": _iso(fin_tache),
-                    "duree_secondes": int((fin_tache - debut_tache).total_seconds()),
+                    "decalage_minutes": tache.get("decalage_minutes", 0),
+                    "duree_secondes": int(
+                        (fin_tache - debut_tache).total_seconds()
+                    ),
                 }
             )
 
@@ -288,8 +336,21 @@ def _statistique_jour(
             {
                 "nom": tache["nom"],
                 "debut_utc": tache["debut_utc"],
-                "fin_utc": tache["fin_utc"],
-                "duree_secondes": tache["duree_secondes"],
+                "fin_utc": _iso(
+                    min(
+                        _utc(datetime.fromisoformat(tache["fin_utc"])),
+                        _fin_journee_utc(
+                            date_jour,
+                            tache.get("decalage_minutes", 0),
+                        ),
+                    )
+                ),
+                "duree_secondes": _duree_jusqua_fin_journee(
+                    datetime.fromisoformat(tache["debut_utc"]),
+                    datetime.fromisoformat(tache["fin_utc"]),
+                    date_jour,
+                    tache.get("decalage_minutes", 0),
+                ),
             }
             for tache in taches
         ],
@@ -609,6 +670,9 @@ def creer_routeur_temps_travail(db):
                     "precision_fiable": precision_fiable,
                     "est_simulee": corps.est_simulee,
                     "dans_ferme": dans_ferme,
+                    "latitude": corps.latitude,
+                    "longitude": corps.longitude,
+                    "precision_m": corps.precision_m,
                 }
             },
             upsert=True,
@@ -710,6 +774,16 @@ def creer_routeur_temps_travail(db):
                     "derniere_verification_utc": (
                         _iso(derniere_verification)
                         if derniere_verification is not None
+                        else None
+                    ),
+                    "latitude": (
+                        presence.get("latitude")
+                        if presence_recente and presence
+                        else None
+                    ),
+                    "longitude": (
+                        presence.get("longitude")
+                        if presence_recente and presence
                         else None
                     ),
                 }
