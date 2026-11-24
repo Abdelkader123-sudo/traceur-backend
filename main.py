@@ -22,7 +22,7 @@ from gridfs.errors import NoFile
 from pymongo import MongoClient
 from pymongo.errors import OperationFailure, PyMongoError
 
-from DBSCAN import analyser_troupeaux, est_immobile
+from DBSCAN import analyser_troupeaux
 from geofence import evaluer_hors_zone, valider_sommets
 from IA.ia_routes import creer_router, calculer_bilan, SEUIL_HEURES_ALERTE   # AJOUT IA
 from params import BORNES, DEFAUTS, valider_parametres
@@ -288,6 +288,16 @@ def resoudre_alertes_deplacement_inhabituel():
         )
 
 
+def resoudre_alertes_immobilite():
+    maintenant = datetime.now(timezone.utc)
+    resultat = alerts.update_many(
+        {"type": "immobilite", "resolue": False},
+        {"$set": {"resolue": True, "resolue_le": maintenant}},
+    )
+    if resultat.modified_count:
+        print(f"Alertes d’immobilité clôturées : {resultat.modified_count}")
+
+
 def appliquer_alerte_ia(animal_id, condition, message, client_id):
     """AJOUT IA : branche le bilan Isolation Forest sur le système d'alertes existant
     (ouverture, résolution automatique, diffusion WebSocket), à la dernière position connue."""
@@ -462,6 +472,13 @@ def creer_index_nettoyage():
         (base["temps_travail_evenements"], "horodatage_utc"),
     ):
         try:
+            if collection is pasture:
+                for nom, index in collection.index_information().items():
+                    if (
+                        index.get("expireAfterSeconds") is not None
+                        and ("cree_le", 1) in index.get("key", [])
+                    ):
+                        collection.drop_index(nom)
             collection.create_index(champ)
         except Exception as erreur:
             print(f"Index {champ} non créé ({collection.name}) : {erreur}")
@@ -603,29 +620,6 @@ def verifier_pature(p):
         f"Hors de la zone « {zone['name']} », à {round(bord)} m du bord", p,
     )
 
-
-# ---------------------------------------------------------------------------
-# Alertes individuelles
-# ---------------------------------------------------------------------------
-def verifier_alertes_individuelles(p):
-    client_id = _client_id(p.client_id)
-    prm = P(client_id)
-    duree = prm["duree_immobilite_s"]
-    debut = p.timestamp - timedelta(seconds=duree)
-    fenetre = list(positions.find(
-        {"client_id": client_id, "animal_id": p.animal_id,
-         "timestamp": {"$gte": debut, "$lte": p.timestamp}},
-        {"_id": 0}).sort("timestamp", 1))
-    repere = positions.find_one(
-        {"client_id": client_id, "animal_id": p.animal_id,
-         "timestamp": {"$lt": debut}},
-        {"_id": 0}, sort=[("timestamp", -1)])
-    if repere:
-        fenetre.insert(0, repere)
-    gerer_alerte(
-        p.animal_id, "immobilite",
-        est_immobile(fenetre, duree, prm["vitesse_repos_max"]),
-        f"Au repos depuis plus de {duree // 60} min", p)
 
 # ---------------------------------------------------------------------------
 # Collier silencieux
@@ -826,8 +820,7 @@ def on_message(mqtt_client_instance, userdata, msg):
     except Exception as erreur:
         print(f"Erreur collier_silencieux : {erreur}")
 
-    for verification in (verifier_troupeau, verifier_pature,
-                         verifier_alertes_individuelles):
+    for verification in (verifier_troupeau, verifier_pature):
         try:
             verification(position)
         except Exception as erreur:
@@ -864,6 +857,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(creer_index_ttl)            # AJOUT IA AUTO
     await asyncio.to_thread(creer_index_nettoyage)      # AJOUT NETTOYAGE
     await asyncio.to_thread(resoudre_alertes_deplacement_inhabituel)
+    await asyncio.to_thread(resoudre_alertes_immobilite)
     mqtt_client.connect(MQTT_HOST, MQTT_PORT)
     mqtt_client.loop_start()
     tache = asyncio.create_task(surveillance_colliers())
@@ -1420,11 +1414,10 @@ def reevaluer_tous(client_id, numero_client):
             verifier_troupeau(p, reevaluation=True)
         except Exception as e:
             print(f"Erreur verifier_troupeau : {e}")
-        for verification in (verifier_pature, verifier_alertes_individuelles):
-            try:
-                verification(p)
-            except Exception as e:
-                print(f"Erreur {verification.__name__} : {e}")
+        try:
+            verifier_pature(p)
+        except Exception as e:
+            print(f"Erreur verifier_pature : {e}")
     try:
         verifier_colliers(client_id)
     except Exception as e:

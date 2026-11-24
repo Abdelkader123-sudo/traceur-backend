@@ -1,4 +1,3 @@
-import os
 from datetime import datetime, timedelta, timezone
 
 from messagerie import nettoyer_conversations
@@ -9,7 +8,6 @@ DUREE_MPU_J = 9
 DUREE_ALERTES_H = 26
 DUREE_CONVERSATIONS_J = 3
 DUREE_TEMPS_TRAVAIL_J = 30
-DUREE_DONNEES_H = float(os.getenv("DUREE_DONNEES_H", "170"))
 
 
 def nettoyer_donnees(db, client_id=None, maintenant=None, notifier_alerte=None):
@@ -20,7 +18,6 @@ def nettoyer_donnees(db, client_id=None, maintenant=None, notifier_alerte=None):
     limite_alertes = maintenant - timedelta(hours=DUREE_ALERTES_H)
     limite_conversations = maintenant - timedelta(days=DUREE_CONVERSATIONS_J)
     limite_temps_travail = maintenant - timedelta(days=DUREE_TEMPS_TRAVAIL_J)
-    limite_donnees = maintenant - timedelta(hours=DUREE_DONNEES_H)
 
     filtre_tenant = {"client_id": client_id} if client_id is not None else {}
     filtre_alertes = {**filtre_tenant, "timestamp": {"$lt": limite_alertes}}
@@ -42,9 +39,8 @@ def nettoyer_donnees(db, client_id=None, maintenant=None, notifier_alerte=None):
     bilan["evenements_lstm"] = db["lstm_alertes_silencieuses"].delete_many(
         {**filtre_tenant, "cree_le": {"$lt": limite_alertes}}
     ).deleted_count
-    bilan["anciennes_zones"] = db["pastures"].delete_many(
-        {**filtre_tenant, "active": False, "cree_le": {"$lt": limite_donnees}}
-    ).deleted_count
+    # Keep this field for response compatibility; pasture zone records are retained.
+    bilan["anciennes_zones"] = 0
     bilan["evenements_travail"] = db["temps_travail_evenements"].delete_many(
         {**filtre_tenant, "horodatage_utc": {"$lt": limite_temps_travail}}
     ).deleted_count
