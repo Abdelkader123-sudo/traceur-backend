@@ -22,7 +22,7 @@ from gridfs.errors import NoFile
 from pymongo import MongoClient
 from pymongo.errors import OperationFailure, PyMongoError
 
-from DBSCAN import analyser_troupeaux, deplacement_inhabituel, est_immobile
+from DBSCAN import analyser_troupeaux, est_immobile
 from geofence import evaluer_hors_zone, valider_sommets
 from IA.ia_routes import creer_router, calculer_bilan, SEUIL_HEURES_ALERTE   # AJOUT IA
 from params import BORNES, DEFAUTS, valider_parametres
@@ -273,6 +273,19 @@ def gerer_alerte(animal_id, type_alerte, condition, message, position):
             "type": type_alerte,
             "resolue_le": position.timestamp,
         }}, client_id)
+
+
+def resoudre_alertes_deplacement_inhabituel():
+    maintenant = datetime.now(timezone.utc)
+    resultat = alerts.update_many(
+        {"type": "deplacement_inhabituel", "resolue": False},
+        {"$set": {"resolue": True, "resolue_le": maintenant}},
+    )
+    if resultat.modified_count:
+        print(
+            "Alertes de déplacement inhabituel clôturées : "
+            f"{resultat.modified_count}"
+        )
 
 
 def appliquer_alerte_ia(animal_id, condition, message, client_id):
@@ -614,16 +627,6 @@ def verifier_alertes_individuelles(p):
         est_immobile(fenetre, duree, prm["vitesse_repos_max"]),
         f"Au repos depuis plus de {duree // 60} min", p)
 
-    nb = prm["nb_mesures_vitesse"]
-    dernieres = list(positions.find(
-                     {"client_id": client_id, "animal_id": p.animal_id}, {"_id": 0})
-                     .sort("timestamp", -1).limit(nb))[::-1]
-    gerer_alerte(
-        p.animal_id, "deplacement_inhabituel",
-        deplacement_inhabituel(dernieres, prm["vitesse_max"], nb),
-        f"Vitesse supérieure à {prm['vitesse_max']} km/h sur {nb} mesures", p)
-
-
 # ---------------------------------------------------------------------------
 # Collier silencieux
 # ---------------------------------------------------------------------------
@@ -860,6 +863,7 @@ async def lifespan(app: FastAPI):
     )      # AJOUT IA
     await asyncio.to_thread(creer_index_ttl)            # AJOUT IA AUTO
     await asyncio.to_thread(creer_index_nettoyage)      # AJOUT NETTOYAGE
+    await asyncio.to_thread(resoudre_alertes_deplacement_inhabituel)
     mqtt_client.connect(MQTT_HOST, MQTT_PORT)
     mqtt_client.loop_start()
     tache = asyncio.create_task(surveillance_colliers())
