@@ -23,9 +23,9 @@ from pymongo import MongoClient
 from pymongo.errors import OperationFailure, PyMongoError
 
 from DBSCAN import analyser_troupeaux, deplacement_inhabituel, est_immobile
-from geofence import analyser_point, valider_sommets
+from geofence import evaluer_hors_zone, valider_sommets
 from IA.ia_routes import creer_router, calculer_bilan, SEUIL_HEURES_ALERTE   # AJOUT IA
-from params import BORNES, DEFAUTS, FIXES, valider_parametres
+from params import BORNES, DEFAUTS, valider_parametres
 import trajectoire_service                                   # AJOUT LSTM
 from auth import creer_dependance_courant, creer_routeur     # AJOUT AUTH
 from colliers import (
@@ -107,15 +107,14 @@ _cache_zone = {}
 
 
 def P(client_id=None) -> dict:
-    """Paramètres actifs (défauts + valeurs enregistrées). reference_jours est fixé à 4.
-    Les paramètres de FIXES (ex. marge_pature_m) gardent toujours leur valeur par défaut."""
+    """Paramètres actifs (défauts + valeurs enregistrées). reference_jours est fixé."""
     cle = str(client_id or "legacy")
     if cle not in _cache_params:
         filtre = {"client_id": client_id} if client_id is not None else {"_id": "global"}
         doc = parametres_col.find_one(filtre) or {}
         _cache_params[cle] = {
             **DEFAUTS,
-            **{k: doc[k] for k in DEFAUTS if k in doc and k not in FIXES},
+            **{k: doc[k] for k in DEFAUTS if k in doc},
             "reference_jours": REFERENCE_JOURS,
         }
     return _cache_params[cle]
@@ -585,8 +584,7 @@ def verifier_pature(p):
     if not zone:
         return
     sommets = [(c["latitude"], c["longitude"]) for c in zone["coordinates"]]
-    dedans, bord = analyser_point(p.lat, p.lon, sommets)
-    hors = (not dedans) and bord > P(client_id)["marge_pature_m"]
+    hors, bord = evaluer_hors_zone(p.lat, p.lon, sommets)
     gerer_alerte(
         p.animal_id, "hors_pature", hors,
         f"Hors de la zone « {zone['name']} », à {round(bord)} m du bord", p,

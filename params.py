@@ -9,8 +9,7 @@ DEFAUTS = {
     "duree_immobilite_s": 1800,    # repos continu avant alerte (s)
     "delai_collier_s": 600,        # silence du collier avant alerte (s)
 
-    # --- Retirés de l'interface : valeurs fixes utilisées par le backend ---
-    "marge_pature_m": 10,          # tolérance hors zone dessinée (m) - fixe, non modifiable
+    # --- Valeurs fixes utilisées par le backend ---
     "nb_confirmations": 2,         # messages consécutifs hors zone avant alerte
     "fraicheur_s": 600,            # âge max d'une position prise en compte (s)
     "nb_mesures_vitesse": 3,       # mesures rapides consécutives avant alerte
@@ -19,10 +18,6 @@ DEFAUTS = {
     # --- Réglé depuis la page Historique d'activité ---
     "reference_jours": 7,          # durée de la référence IA (jours)
 }
-
-# Paramètres dont la valeur est toujours celle de DEFAUTS : une ancienne valeur
-# enregistrée dans la base de données est ignorée.
-FIXES = {"marge_pature_m"}
 
 # clé: (minimum, maximum, entier ?)
 # Seuls les paramètres présents ici peuvent être modifiés par l'application.
