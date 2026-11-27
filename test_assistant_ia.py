@@ -1,6 +1,7 @@
 import json
 import urllib.request
 
+import pytest
 from bson import ObjectId
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -174,7 +175,7 @@ def test_appel_openai_forme_la_requete_sans_appel_reseau(monkeypatch):
 
 def test_route_convertit_les_erreurs_openai_en_erreur_api(monkeypatch):
     def generer(*_):
-        raise ErreurOpenAI("Erreur distante privée.")
+        raise ErreurOpenAI(500)
 
     utilisateur = {"client_id": ObjectId(), "role": "superadmin"}
     app = FastAPI()
@@ -194,4 +195,41 @@ def test_route_convertit_les_erreurs_openai_en_erreur_api(monkeypatch):
     )
 
     assert reponse.status_code == 502
-    assert "Erreur distante privée." not in reponse.text
+    assert "HTTP 500" not in reponse.text
+
+
+@pytest.mark.parametrize(
+    ("status_code", "detail"),
+    [
+        (401, "La clé OpenAI configurée sur le serveur est invalide."),
+        (429, "Le quota ou la limite de requêtes OpenAI est atteint."),
+        (404, "Le modèle OpenAI configuré sur le serveur est introuvable."),
+    ],
+)
+def test_route_explique_les_erreurs_de_configuration_openai(
+    monkeypatch,
+    status_code,
+    detail,
+):
+    def generer(*_):
+        raise ErreurOpenAI(status_code)
+
+    utilisateur = {"client_id": ObjectId(), "role": "superadmin"}
+    app = FastAPI()
+    app.include_router(
+        creer_routeur(
+            FauxAnimaux([]),
+            FauxUtilisateurs(),
+            lambda: utilisateur,
+            generer,
+        )
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "cle-de-test")
+
+    reponse = TestClient(app).post(
+        "/assistant/chat",
+        json={"messages": [{"role": "user", "content": "Question"}]},
+    )
+
+    assert reponse.status_code == 503
+    assert reponse.json()["detail"] == detail

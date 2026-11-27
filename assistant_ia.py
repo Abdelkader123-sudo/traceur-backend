@@ -57,7 +57,9 @@ class DemandeAssistant(BaseModel):
 
 
 class ErreurOpenAI(Exception):
-    pass
+    def __init__(self, status_code: int | None = None):
+        super().__init__()
+        self.status_code = status_code
 
 
 def _type_animal(type_brut: object) -> tuple[str, str]:
@@ -164,18 +166,18 @@ def appeler_openai(messages: list[dict], cle_api: str, modele: str) -> str:
         with urllib.request.urlopen(requete, timeout=30) as reponse:
             donnees = json.loads(reponse.read().decode("utf-8"))
     except urllib.error.HTTPError as erreur:
-        raise ErreurOpenAI(f"OpenAI a répondu HTTP {erreur.code}.") from None
+        raise ErreurOpenAI(erreur.code) from None
     except (urllib.error.URLError, TimeoutError):
-        raise ErreurOpenAI("Connexion au service OpenAI impossible.") from None
+        raise ErreurOpenAI() from None
     except (json.JSONDecodeError, UnicodeDecodeError):
-        raise ErreurOpenAI("Réponse OpenAI invalide.") from None
+        raise ErreurOpenAI() from None
 
     try:
         texte = donnees["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
-        raise ErreurOpenAI("Réponse OpenAI invalide.") from None
+        raise ErreurOpenAI() from None
     if not isinstance(texte, str) or not texte.strip():
-        raise ErreurOpenAI("OpenAI n’a pas fourni de réponse exploitable.")
+        raise ErreurOpenAI()
     return texte.strip()
 
 
@@ -238,7 +240,22 @@ def creer_routeur(animaux, utilisateurs, courant, generer_reponse=None):
         modele = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
         try:
             reponse = appeler(messages_openai, cle_api, modele)
-        except ErreurOpenAI:
+        except ErreurOpenAI as erreur:
+            if erreur.status_code in (401, 403):
+                raise HTTPException(
+                    503,
+                    "La clé OpenAI configurée sur le serveur est invalide.",
+                ) from None
+            if erreur.status_code == 429:
+                raise HTTPException(
+                    503,
+                    "Le quota ou la limite de requêtes OpenAI est atteint.",
+                ) from None
+            if erreur.status_code == 404:
+                raise HTTPException(
+                    503,
+                    "Le modèle OpenAI configuré sur le serveur est introuvable.",
+                ) from None
             raise HTTPException(
                 502,
                 "Le service IA est momentanément indisponible. Réessayez plus tard.",
