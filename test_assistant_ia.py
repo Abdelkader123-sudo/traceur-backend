@@ -7,8 +7,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from assistant_ia import (
-    ErreurOpenAI,
-    appeler_openai,
+    ErreurGemini,
+    appeler_gemini,
     construire_statistiques,
     creer_routeur,
 )
@@ -109,7 +109,7 @@ def test_route_repond_avec_statistiques_et_refuse_un_utilisateur_non_autorise(
     app = FastAPI()
     app.include_router(creer_routeur(animaux, utilisateurs, courant, generer))
     client = TestClient(app)
-    monkeypatch.setenv("OPENAI_API_KEY", "cle-de-test")
+    monkeypatch.setenv("GEMINI_API_KEY", "cle-de-test")
 
     reponse = client.post(
         "/assistant/chat",
@@ -118,7 +118,7 @@ def test_route_repond_avec_statistiques_et_refuse_un_utilisateur_non_autorise(
 
     assert reponse.status_code == 200
     assert reponse.json() == {"answer": "La ferme compte une vache Jersiaise."}
-    assert appels[0][1:] == ("cle-de-test", "gpt-4.1-mini")
+    assert appels[0][1:] == ("cle-de-test", "gemini-3.5-flash-lite")
     assert '"total": 1' in appels[0][0][1]["content"]
 
     utilisateur["pages_autorisees"] = ["animals"]
@@ -130,13 +130,13 @@ def test_route_repond_avec_statistiques_et_refuse_un_utilisateur_non_autorise(
     assert len(appels) == 1
 
 
-def test_route_signale_l_absence_de_cle_openai(monkeypatch):
+def test_route_signale_l_absence_de_cle_gemini(monkeypatch):
     utilisateur = {"client_id": ObjectId(), "role": "superadmin"}
     app = FastAPI()
     app.include_router(
         creer_routeur(FauxAnimaux([]), FauxUtilisateurs(), lambda: utilisateur)
     )
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
 
     reponse = TestClient(app).post(
         "/assistant/chat",
@@ -146,7 +146,7 @@ def test_route_signale_l_absence_de_cle_openai(monkeypatch):
     assert reponse.status_code == 503
 
 
-def test_appel_openai_forme_la_requete_sans_appel_reseau(monkeypatch):
+def test_appel_gemini_forme_la_requete_sans_appel_reseau(monkeypatch):
     class FauxReponse:
         def __enter__(self):
             return self
@@ -155,27 +155,41 @@ def test_appel_openai_forme_la_requete_sans_appel_reseau(monkeypatch):
             return False
 
         def read(self):
-            return b'{"choices":[{"message":{"content":"Bonjour."}}]}'
+            return b'{"candidates":[{"content":{"parts":[{"text":"Bonjour."}]}}]}'
 
     def urlopen(requete, timeout):
         assert timeout == 30
-        assert requete.get_header("Authorization") == "Bearer cle-de-test"
+        assert requete.get_header("X-goog-api-key") == "cle-de-test"
+        assert requete.full_url.endswith(
+            "/models/gemini-3.5-flash-lite:generateContent"
+        )
         corps = json.loads(requete.data)
-        assert corps["model"] == "gpt-4.1-mini"
+        assert corps["systemInstruction"]["parts"][0]["text"] == "Consignes"
+        assert corps["contents"] == [
+            {"role": "user", "parts": [{"text": "Question précédente"}]},
+            {"role": "model", "parts": [{"text": "Réponse précédente"}]},
+            {"role": "user", "parts": [{"text": "Bonjour"}]}
+        ]
         return FauxReponse()
 
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
 
-    assert appeler_openai(
-        [{"role": "user", "content": "Bonjour"}],
+    assert appeler_gemini(
+        [
+            {"role": "system", "content": "Consignes"},
+            {"role": "assistant", "content": "Réponse précédente oubliée"},
+            {"role": "user", "content": "Question précédente"},
+            {"role": "assistant", "content": "Réponse précédente"},
+            {"role": "user", "content": "Bonjour"},
+        ],
         "cle-de-test",
-        "gpt-4.1-mini",
+        "gemini-3.5-flash-lite",
     ) == "Bonjour."
 
 
-def test_route_convertit_les_erreurs_openai_en_erreur_api(monkeypatch):
+def test_route_convertit_les_erreurs_gemini_en_erreur_api(monkeypatch):
     def generer(*_):
-        raise ErreurOpenAI(500)
+        raise ErreurGemini(500)
 
     utilisateur = {"client_id": ObjectId(), "role": "superadmin"}
     app = FastAPI()
@@ -187,7 +201,7 @@ def test_route_convertit_les_erreurs_openai_en_erreur_api(monkeypatch):
             generer,
         )
     )
-    monkeypatch.setenv("OPENAI_API_KEY", "cle-de-test")
+    monkeypatch.setenv("GEMINI_API_KEY", "cle-de-test")
 
     reponse = TestClient(app).post(
         "/assistant/chat",
@@ -201,18 +215,22 @@ def test_route_convertit_les_erreurs_openai_en_erreur_api(monkeypatch):
 @pytest.mark.parametrize(
     ("status_code", "detail"),
     [
-        (401, "La clé OpenAI configurée sur le serveur est invalide."),
-        (429, "Le quota ou la limite de requêtes OpenAI est atteint."),
-        (404, "Le modèle OpenAI configuré sur le serveur est introuvable."),
+        (
+            400,
+            "La requête Gemini ou la clé configurée sur le serveur est invalide.",
+        ),
+        (401, "La clé Gemini configurée sur le serveur est invalide."),
+        (429, "Le quota ou la limite de requêtes Gemini est atteint."),
+        (404, "Le modèle Gemini configuré sur le serveur est introuvable."),
     ],
 )
-def test_route_explique_les_erreurs_de_configuration_openai(
+def test_route_explique_les_erreurs_de_configuration_gemini(
     monkeypatch,
     status_code,
     detail,
 ):
     def generer(*_):
-        raise ErreurOpenAI(status_code)
+        raise ErreurGemini(status_code)
 
     utilisateur = {"client_id": ObjectId(), "role": "superadmin"}
     app = FastAPI()
@@ -224,7 +242,7 @@ def test_route_explique_les_erreurs_de_configuration_openai(
             generer,
         )
     )
-    monkeypatch.setenv("OPENAI_API_KEY", "cle-de-test")
+    monkeypatch.setenv("GEMINI_API_KEY", "cle-de-test")
 
     reponse = TestClient(app).post(
         "/assistant/chat",
