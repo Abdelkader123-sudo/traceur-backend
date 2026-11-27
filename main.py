@@ -23,6 +23,7 @@ from pymongo import MongoClient
 from pymongo.errors import OperationFailure, PyMongoError
 
 from DBSCAN import analyser_troupeaux
+from assistant_ia import creer_routeur as creer_routeur_assistant
 from geofence import evaluer_hors_zone, valider_sommets
 from IA.ia_routes import creer_router, calculer_bilan, SEUIL_HEURES_ALERTE   # AJOUT IA
 from params import BORNES, DEFAUTS, valider_parametres
@@ -893,6 +894,7 @@ app.include_router(creer_router(mesures_activite, appliquer_alerte_ia,
 app.include_router(creer_routeur(base))
 app.include_router(creer_routeur_messagerie(base))
 app.include_router(creer_routeur_temps_travail(base))
+app.include_router(creer_routeur_assistant(animaux, base["utilisateurs"], courant))
 
 
 # ---------------------------------------------------------------------------
