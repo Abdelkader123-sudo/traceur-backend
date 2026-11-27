@@ -43,6 +43,10 @@ class ZoneTravail(BaseModel):
     rayon_m: int = Field(ge=30, le=5000)
 
 
+class TauxHoraireTravail(BaseModel):
+    taux_horaire: float = Field(gt=0, allow_inf_nan=False)
+
+
 def _utc(instant: datetime) -> datetime:
     if instant.tzinfo is None:
         return instant.replace(tzinfo=timezone.utc)
@@ -372,6 +376,7 @@ def creer_routeur_temps_travail(db):
     presence_col = db["temps_travail_presence"]
     demandes_presence_col = db["temps_travail_demandes_presence"]
     zones_col = db["temps_travail_zones"]
+    salaires_col = db["temps_travail_salaires"]
     evenements_col.create_index(
         [("client_id", 1), ("utilisateur_id", 1), ("evenement_id", 1)],
         unique=True,
@@ -406,6 +411,11 @@ def creer_routeur_temps_travail(db):
         [("client_id", 1)],
         unique=True,
         name="temps_travail_zone_unique",
+    )
+    salaires_col.create_index(
+        [("client_id", 1), ("utilisateur_id", 1)],
+        unique=True,
+        name="temps_travail_salaire_utilisateur_unique",
     )
 
     router = APIRouter(tags=["temps-travail"])
@@ -608,6 +618,71 @@ def creer_routeur_temps_travail(db):
             )
         return {"utilisateurs": utilisateurs}
 
+    @router.get("/admin/temps-travail/salaires")
+    def salaires_admin(utilisateur: dict = Depends(courant)):
+        _verifier_proprietaire(utilisateur)
+        membres = {
+            membre["_id"]
+            for membre in users.find(
+                {
+                    "client_id": utilisateur["client_id"],
+                    "role": {"$ne": "superadmin"},
+                }
+            )
+        }
+        return {
+            "salaires": [
+                {
+                    "utilisateur_id": str(document["utilisateur_id"]),
+                    "taux_horaire": document["taux_horaire"],
+                }
+                for document in salaires_col.find(
+                    {"client_id": utilisateur["client_id"]}
+                )
+                if document.get("utilisateur_id") in membres
+            ]
+        }
+
+    @router.put("/admin/temps-travail/salaires/{utilisateur_id}")
+    def definir_salaire_admin(
+        utilisateur_id: str,
+        corps: TauxHoraireTravail,
+        utilisateur: dict = Depends(courant),
+    ):
+        _verifier_proprietaire(utilisateur)
+        if not ObjectId.is_valid(utilisateur_id):
+            raise HTTPException(404, "Utilisateur introuvable.")
+        membre_id = ObjectId(utilisateur_id)
+        membre = users.find_one(
+            {
+                "_id": membre_id,
+                "client_id": utilisateur["client_id"],
+                "role": {"$ne": "superadmin"},
+            }
+        )
+        if membre is None:
+            raise HTTPException(404, "Utilisateur introuvable.")
+
+        salaires_col.update_one(
+            {
+                "client_id": utilisateur["client_id"],
+                "utilisateur_id": membre_id,
+            },
+            {
+                "$set": {
+                    "client_id": utilisateur["client_id"],
+                    "utilisateur_id": membre_id,
+                    "taux_horaire": corps.taux_horaire,
+                    "mis_a_jour_utc": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
+        )
+        return {
+            "utilisateur_id": utilisateur_id,
+            "taux_horaire": corps.taux_horaire,
+        }
+
     @router.get("/temps-travail/presence/configuration")
     def configuration_presence(utilisateur: dict = Depends(courant)):
         zone = zones_col.find_one({"client_id": utilisateur["client_id"]})
@@ -643,6 +718,16 @@ def creer_routeur_temps_travail(db):
         corps: RapportPresence,
         utilisateur: dict = Depends(courant),
     ):
+        if corps.est_simulee:
+            raise HTTPException(
+                422,
+                "Une position simulée ne peut pas être utilisée pour la présence.",
+            )
+        if corps.latitude == 0.0 and corps.longitude == 0.0:
+            raise HTTPException(
+                422,
+                "La position obtenue est invalide.",
+            )
         etat = _etat_courant(utilisateur)
         journee = etat["journee_active"]
         if journee is None or journee["journee_id"] != corps.journee_id:
@@ -832,6 +917,11 @@ def creer_routeur_temps_travail(db):
                 422,
                 "Une position réelle et suffisamment précise est nécessaire.",
             )
+        if corps.latitude == 0.0 and corps.longitude == 0.0:
+            raise HTTPException(
+                422,
+                "La position obtenue est invalide.",
+            )
         resultat = demandes_presence_col.update_one(
             {**filtre, "expire_le_utc": {"$gt": maintenant}},
             {
@@ -939,12 +1029,18 @@ def creer_routeur_temps_travail(db):
             demande_position = demandes_par_utilisateur.get(membre["_id"])
             latitude = (
                 presence.get("latitude")
-                if presence_recente and presence
+                if presence_recente
+                and presence
+                and not presence.get("est_simulee")
+                and presence.get("precision_fiable")
                 else None
             )
             longitude = (
                 presence.get("longitude")
-                if presence_recente and presence
+                if presence_recente
+                and presence
+                and not presence.get("est_simulee")
+                and presence.get("precision_fiable")
                 else None
             )
             if (
